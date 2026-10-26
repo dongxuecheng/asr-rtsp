@@ -1,0 +1,170 @@
+# RTSP 语音归档
+
+持续读取一路 RTSP 音频，检测人声，保存 WAV，调用已有 ASR 服务并归档文本。网页提供每日记录、关键词搜索、分页、说话人片段、回放定位、WAV 下载和当日 TXT 导出。支持断流重连、无数据 watchdog、HTTP 重试、容器停止时排空队列，以及按日期定时删除历史数据。
+
+## 原脚本的问题与改造
+
+原脚本已有 FFmpeg TCP 拉流、`select` 超时检测、ASR 工作队列和异常重试，适合长期监听。但原来的 `--threshold` 是对 **整个 45 秒块** 计算 RMS；一小段讲话也会使整块被保存，背景噪声也可能通过过滤。原脚本在 ASR 请求前保存 WAV，因此识别失败和没有文字的块也会保留，但没有可查询的状态索引、前端和保留期限。它还依赖已从 Python 3.13 移除的 `audioop`。
+
+现在保留拉流与重试能力，将代码拆分为：
+
+| 文件 | 职责 |
+| --- | --- |
+| `rtsp_asr_save_audio.py` | 配置、采集循环、ASR worker、清理调度、SIGTERM 退出 |
+| `rtsp_stream.py` | FFmpeg、stderr 消费、watchdog、按日运行日志、RTSP 密码脱敏 |
+| `speech.py` | 30ms WebRTC VAD、人声切段、样本时间轴、无 audioop 的 RMS |
+| `storage.py` | 每日 SQLite、原子写入 WAV、识别状态、历史目录清理 |
+| `web.py`、`static/` | Flask 只读 API、每日档案页面 |
+| `Dockerfile`、`compose.yaml` | 采集与网页两个服务、共享持久卷、日志轮转 |
+
+数据流：`RTSP → FFmpeg 16kHz 单声道 PCM → VAD → ASR 队列 → WAV + pending → ASR → 文本/说话人/状态`。
+
+页面预览（演示数据）：
+
+![每日语音档案](docs/preview.png)
+
+## 启动
+
+需要运行中的 Docker Engine / Docker Desktop，支持 Compose v2。ASR **继续使用已有的 HTTP 服务**，镜像不包含 ASR 模型，也不需要 GPU。
+
+1. 在项目目录复制配置：
+
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+
+   Linux：`cp .env.example .env`。
+
+2. 编辑 `.env`，至少修改 `RTSP_URL`，核对 `ASR_API_URL`。容器必须能访问摄像头和 ASR 所在网络。Docker Desktop 内访问宿主机 ASR 可使用 `http://host.docker.internal:端口/v1/audio/transcriptions`；容器内的 `localhost` 指容器自身。
+
+3. 构建并启动：
+
+   ```sh
+   docker compose up -d --build
+   docker compose logs -f collector
+   ```
+
+4. 打开 [每日语音档案](http://localhost:8080)。没有语音时页面显示空状态。网页和采集服务独立运行，摄像头断流时仍可查看历史记录。
+
+默认仅宿主机可访问网页。如需局域网访问，将 `WEB_BIND=0.0.0.0`，同时设置 `WEB_USERNAME` 和 `WEB_PASSWORD`；页面、API、录音和静态文件一起受 HTTP Basic 认证保护。跨公网使用时通过 HTTPS 反向代理访问。
+
+`.env` 的值如含 `$`、`#`，请使用单引号；RTSP 用户名/密码中的 `@`、`:` 等保留字符还需要 URL 编码。`.env` 不会打包进镜像。
+
+修改 `.env` 后运行 `docker compose up -d`，会重建配置发生变化的容器；仅执行 `restart` 不会载入新的环境变量。
+
+## “只保存有效声音”的具体含义
+
+当前实现针对 **人声**，使用 WebRTC VAD，而不是把所有非零声波都保存。它按 30ms 帧检测，默认满足一段持续人声后启动，带最多约 300ms 前缓冲，遇约 600ms 连续非语音结束。短暂停顿保留，较长静音不落盘，也不送 ASR；连续长语音最多每 45 秒拆段。停止或断流时会提交尚未结束的有效片段。
+
+音频按连续片段分别保存，不把不同时间的讲话拼成一条；记录包含采集起始时间，ASR 的片段偏移相对于各自 WAV，页面点击 `+Xs` 可跳转回放。跨午夜的片段按**片段开始日期**归档。时间以采集器收到第一帧时的本地时钟为锚点，按样本数推进，并非摄像头原始 PTS。
+
+VAD 是检测器，会有漏检和误检：远处很小的说话声可能漏掉，音乐或某些噪声可能被判为人声。默认不丢弃“ASR 无文本”或“ASR 失败”的录音，避免因识别服务问题丢失有效讲话；可在页面看到相应状态。这不是“只保存识别成功文字对应的声音”。
+
+| 配置项 | 默认 | 调整建议 |
+| --- | --- | --- |
+| `VAD_MODE` | `2` | `0` 最宽松，`3` 最严格；噪声误检多时增大，漏掉轻声时减小 |
+| `RMS_THRESHOLD` | `20` | 16-bit PCM 帧音量下限；`0` 关闭 RMS 门限，仍启用 VAD |
+| `MIN_SPEECH_MS` | `300` | 每个独立片段最少累计人声；很短的应答可能需要调低 |
+| `SILENCE_MS` | `600` | 连续非语音多久结束；增大可保留更长的句间停顿 |
+| `PADDING_MS` | `300` | 开始检测的人声窗口及前缓冲；通常保持默认 |
+| `MAX_SEGMENT_SECONDS` | `45` | 连续语音的最大片段，避免请求和内存无上限增长 |
+
+WAV 为 16kHz / 单声道 / 16-bit，约 **115MB/小时保存音频**，实际占用取决于讲话时长；如果一天仅有两小时有效讲话，约 230MB/天，加少量数据库和日志。
+
+VAD 输入格式依据 [webrtcvad-wheels 文档](https://pypi.org/project/webrtcvad-wheels/)；音频接口通过 Flask 的 [conditional / Range 响应](https://flask.palletsprojects.com/en/stable/api/#flask.send_file) 支持播放器拖动进度。
+
+## 定时删除
+
+```dotenv
+RETENTION_DAYS=7
+CLEANUP_INTERVAL_SECONDS=3600
+```
+
+默认保留**最近 7 个本地日历日期，含今天**，每小时检查一次，采集器启动时也检查。举例：2026-10-26 保留 10-20 至 10-26，删除 10-19 及之前的日期目录。它不是逐条精确到 168 小时；跨午夜片段的尾部会随其开始日期一起清理。
+
+清理会一并删除该日期的 SQLite（含 ASR 文本、说话人和错误状态）、WAV、可选原始 JSON 和运行日志。仅处理数据根目录下合法的 `YYYY-MM-DD` 子目录，不跟随日期目录符号链接。`RETENTION_DAYS=0` 关闭自动删除。缩短保留期限后，采集器重新启动即会清理到期数据。
+
+清理调度在 `collector` 中运行，**collector 停止期间不会清理**，下次启动时补清；每次删除失败会在日志报告，下轮重试。Docker 标准输出日志另行限制为每服务最多 3 份 × 10MB。
+
+## 数据位置与备份
+
+默认使用 Docker 命名卷 `rtsp-asr_asr_data`，两个服务共享数据，网页以只读方式挂载。容器内结构：
+
+```text
+/data/
+  2026-10-26/
+    records.sqlite3
+    audio/meeting_09-30-00-000000_<UUID>.wav
+    raw_json/<UUID>.json                 # SAVE_RAW_JSON=true 才写入
+    runtime/runtime_2026-10-26.log
+    runtime/ffmpeg_2026-10-26.log
+```
+
+停止和重建容器不会删除数据卷。不要用 `docker compose down -v` 来日常停止服务，因为 `-v` 会删除卷。
+
+导出整个数据目录前暂停采集，确保数据库文件一致：
+
+```sh
+docker compose stop collector
+docker compose cp collector:/data ./archive-backup
+docker compose start collector
+```
+
+希望文件直接落到服务器 `./data` 时，可把两个服务的卷分别改为 `./data:/data` 和 `./data:/data:ro`。Linux 上先创建目录并授权容器 UID：
+
+```sh
+mkdir -p data
+sudo chown 10001:10001 data
+```
+
+只运行一个 collector 写入同一数据目录；多个 RTSP 源应使用不同 Compose 项目名和独立数据卷。
+
+## ASR 与运行配置
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `ASR_API_URL` | 原脚本地址 | OpenAI 风格 `/v1/audio/transcriptions` 表单接口 |
+| `ASR_MODEL` / `ASR_LANGUAGE` | `qwen3-asr-0.6b` / `zh` | 模型名、语言 |
+| `ASR_API_KEY` | 空 | 可选 Bearer Token |
+| `ASR_EXTRA_FORM` | `{}` | JSON 对象，覆盖或增加表单字段；JSON 布尔值会转换为小写 true/false |
+| `ASR_WORKERS` / `QUEUE_SIZE` | `1` / `10` | 请求并发和内存队列上限 |
+| `ASR_CONNECT_TIMEOUT` / `ASR_TIMEOUT` | `10` / `180` | 连接、读取超时，秒 |
+| `ASR_RETRY_COUNT` | `2` | 首次失败后最多重试次数；网络失败会重建 Session |
+| `SAVE_RAW_JSON` | `false` | 是否额外保存完整接口响应 |
+| `FFMPEG_TIMEOUT` / `STALL_TIMEOUT` | `20` / `30` | FFmpeg TCP 超时、Python 无 PCM watchdog，秒 |
+| `RECONNECT_DELAY` | `5` | 断流重连间隔，秒 |
+| `STATUS_INTERVAL` | `60` | 拉流状态日志间隔，`0` 关闭 |
+| `SHOW_FFMPEG_LOG` | `false` | 是否把全部 FFmpeg 日志也输出到终端，文件始终保留 |
+| `TZ` | `Asia/Shanghai` | 两个服务应使用相同时区 |
+
+默认请求 `verbose_json` 且 `enable_speaker_diarization=true`，需服务端支持；可用 `ASR_EXTRA_FORM` 覆盖。支持顶层或 `data` / `result` 中的 `text`、`segments`，空 segments 会回退到完整文本。说话人编号来自每次 ASR 返回，**不保证跨请求是同一个人**。时间戳保留原服务的秒/毫秒启发式兼容逻辑，默认按秒，明显超出片段时长的数值按毫秒解析。
+
+队列满时延续原脚本行为，丢弃最旧的**尚未进入 worker** 的片段并记录警告；这些片段没有保存。ASR 过慢时应提升服务速度或并发；本方案不保证拥塞、断流或强制退出时零丢失。SIGTERM 后会等待队列处理完，Compose 最多等待 2 分钟；如果已有大量慢请求，需要调大 `stop_grace_period`。已落盘但进程中断的 `pending` 记录会在下次启动时标记失败，保留音频，不自动重试历史失败项。
+
+## 本地开发与验证
+
+推荐 Python 3.12。Linux 安装 FFmpeg、依赖后，也可以直接运行：
+
+```sh
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+python rtsp_asr_save_audio.py 'rtsp://user:password@camera/stream' --output-dir ./data
+```
+
+另一个终端：
+
+```sh
+DATA_DIR=./data gunicorn --bind 127.0.0.1:8080 'web:create_app()'
+```
+
+直接运行 Python 不会自动读取 `.env`，需要在 shell 设置环境变量或使用脚本的 CLI 参数。Windows 可以开发网页和运行测试，采集器的 `select(pipe)` 依赖 POSIX，应使用 Linux 容器。临时启动本地网页可用 `python -m flask --app 'web:create_app()' run --port 8080`。
+
+```sh
+python -X utf8 -m unittest discover -s tests -v
+docker compose --env-file .env.example config --no-env-resolution --quiet
+```
+
+测试覆盖静音与短脉冲过滤、实际 VAD 的静音检测、长语音拆分与尾段、音频先落盘、ASR 成功/失败、分页搜索、Range 回放、导出、跨日归档、清理边界、重启状态恢复和认证。真实摄像头与 ASR 的识别效果、网络连通性仍需填写实际配置后验证。
+
+旧脚本的 `transcription_logs` 不会自动迁移到网页索引。原脚本的转写 `.log` 已改为 SQLite 归档，需要纯文本时使用网页“导出当日文本”；旧运行日志目录如迁入新数据根目录，也会受日期清理策略影响。

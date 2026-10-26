@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>声迹 · 每日语音档案</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="logo">≋</span><span>声迹<small>DAILY VOICE ARCHIVE</small></span></a>
+    <div class="side-label">语音归档 <span id="dayCount">0 天</span></div>
+    <nav id="days" aria-label="有记录的日期"></nav>
+    <p class="side-note" id="retention">正在读取归档信息…</p>
+  </aside>
+  <main>
+    <header><div><span class="eyebrow">RTSP / ASR</span><h1>每日语音档案</h1><p>把对话留成文字，让声音有迹可循。</p></div><span class="live"><i></i>每 30 秒刷新</span></header>
+    <section class="toolbar" aria-label="查询条件">
+      <div><label for="date">归档日期</label><input type="date" id="date"></div>
+      <form id="searchForm"><label for="query">搜索当日内容</label><div class="search"><input type="search" id="query" placeholder="输入关键词，按回车搜索" maxlength="500"><button type="submit">搜索</button></div></form>
+      <button id="refresh" class="outline" type="button">刷新</button><a id="export" class="download" href="/api/export">↓ 导出当日文本</a>
+    </section>
+    <section class="stats" aria-label="查询结果统计">
+      <div><span>语音片段</span><strong id="total">—</strong><small id="scope">当日全部记录</small></div>
+      <div><span>保存的语音时长</span><strong id="duration">—</strong><small>包含短暂停顿与边界缓冲</small></div>
+      <div><span>需要关注</span><strong id="failed">—</strong><small id="pending">识别状态加载中</small></div>
+    </section>
+    <section class="timeline"><div class="section-title"><h2 id="listTitle">当日记录</h2><span id="pageInfo"></span></div>
+      <p id="notice" role="status" aria-live="polite">正在读取语音记录…</p>
+      <div id="records"></div>
+      <div class="pagination"><button id="prev" class="outline" type="button">← 上一页</button><button id="next" class="outline" type="button">下一页 →</button></div>
+    </section>
+    <footer>仅归档检测到的人声片段 · 录音时间使用采集端时区 <span id="timezone"></span></footer>
+  </main>
+</body>
+</html>

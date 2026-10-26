@@ -1,0 +1,13 @@
+.env
+.venv
+.test-deps
+.uv-cache
+.git
+.pytest_cache
+__pycache__
+*.pyc
+data
+transcription_logs
+tests
+.qa
+README.md

@@ -1,0 +1,41 @@
+name: rtsp-asr
+
+x-common: &common
+  image: rtsp-asr:local
+  build: .
+  init: true
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    DATA_DIR: /data
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  collector:
+    <<: *common
+    command: ["python", "rtsp_asr_save_audio.py"]
+    volumes:
+      - asr_data:/data
+    # SIGTERM stops reading, then drains queued tasks. Forced termination still leaves WAVs.
+    stop_grace_period: 2m
+
+  web:
+    <<: *common
+    command: ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "4", "--access-logfile", "-", "web:create_app()"]
+    volumes:
+      - asr_data:/data:ro
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  asr_data:
