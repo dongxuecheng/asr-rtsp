@@ -27,7 +27,7 @@
 
 需要运行中的 Docker Engine / Docker Desktop，支持 Compose v2。ASR **继续使用已有的 HTTP 服务**，镜像不包含 ASR 模型，也不需要 GPU。
 
-Docker 构建时 APT 使用[清华 TUNA Debian 镜像](https://mirrors.tuna.tsinghua.edu.cn/help/debian/)及其 Debian Security 镜像安装系统依赖。
+Docker 构建时 APT 使用[清华 TUNA Debian 镜像](https://mirrors.tuna.tsinghua.edu.cn/help/debian/)及其 Debian Security 镜像安装系统依赖；pip 使用[清华 TUNA PyPI 镜像](https://mirrors.tuna.tsinghua.edu.cn/help/pypi/)安装 Python 依赖。
 
 1. 在项目目录复制配置：
 

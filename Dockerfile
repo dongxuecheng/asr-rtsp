@@ -13,7 +13,9 @@ RUN sed -i \
     && mkdir /data && chown app:app /data
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir \
+    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    -r requirements.txt
 COPY rtsp_asr_save_audio.py rtsp_stream.py speech.py storage.py web.py ./
 COPY static ./static
 USER app
