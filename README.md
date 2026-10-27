@@ -1,6 +1,6 @@
 # RTSP 语音归档
 
-持续读取一路 RTSP 音频，检测人声，保存 WAV，调用已有 ASR 服务并归档文本。网页提供每日记录、关键词搜索、分页、说话人片段、回放定位、WAV 下载和当日 TXT 导出。支持断流重连、无数据 watchdog、HTTP 重试、容器停止时排空队列，以及按日期定时删除历史数据。
+持续读取一路 RTSP 音频，检测人声并调用已有 ASR 服务，**仅在识别成功且有非空文本时保存 WAV 与文本**。网页只展示这些有效记录，提供日期查询、关键词搜索、分页、说话人片段、回放定位、WAV 下载和当日 TXT 导出。支持断流重连、无数据 watchdog、HTTP 重试、容器停止时排空队列，以及按日期定时删除历史数据。
 
 ## 原脚本的问题与改造
 
@@ -13,11 +13,11 @@
 | `rtsp_asr_save_audio.py` | 配置、采集循环、ASR worker、清理调度、SIGTERM 退出 |
 | `rtsp_stream.py` | FFmpeg、stderr 消费、watchdog、按日运行日志、RTSP 密码脱敏 |
 | `speech.py` | 30ms WebRTC VAD、人声切段、样本时间轴、无 audioop 的 RMS |
-| `storage.py` | 每日 SQLite、原子写入 WAV、识别状态、历史目录清理 |
+| `storage.py` | 每日 SQLite、有效转写与 WAV 归档、历史无效录音与过期目录清理 |
 | `web.py`、`static/` | Flask 只读 API、每日档案页面 |
 | `Dockerfile`、`compose.yaml` | 采集与网页两个服务、共享持久卷、日志轮转 |
 
-数据流：`RTSP → FFmpeg 16kHz 单声道 PCM → VAD → ASR 队列 → WAV + pending → ASR → 文本/说话人/状态`。
+数据流：`RTSP → FFmpeg 16kHz 单声道 PCM → VAD → ASR 队列 → 内存中请求 ASR → 成功且有文本 → WAV + SQLite`。识别失败或无文本的片段直接丢弃，不写入录音、原始 JSON 或记录。
 
 页面预览（演示数据）：
 
@@ -60,7 +60,9 @@ Docker 构建时 APT 使用[清华 TUNA Debian 镜像](https://mirrors.tuna.tsin
 
 音频按连续片段分别保存，不把不同时间的讲话拼成一条；记录包含采集起始时间，ASR 的片段偏移相对于各自 WAV，页面点击 `+Xs` 可跳转回放。跨午夜的片段按**片段开始日期**归档。时间以采集器收到第一帧时的本地时钟为锚点，按样本数推进，并非摄像头原始 PTS。
 
-VAD 是检测器，会有漏检和误检：远处很小的说话声可能漏掉，音乐或某些噪声可能被判为人声。默认不丢弃“ASR 无文本”或“ASR 失败”的录音，避免因识别服务问题丢失有效讲话；可在页面看到相应状态。这不是“只保存识别成功文字对应的声音”。
+VAD 是检测器，会有漏检和误检：远处很小的说话声可能漏掉，音乐或某些噪声可能被判为人声。通过 VAD 后还需经过 ASR：**仅保留识别成功且去除首尾空白后有文本的录音**。请求失败、非法响应、空文本和纯空白文本均不归档，网页的日期列表、统计、搜索、音频接口和导出也只包含成功且有文本的记录。识别中的片段在内存中处理，不会出现在页面中。
+
+这里不对文本进行语义判断：标点、误识别文字等非空内容仍会保留；一段录音只要有有效转写，就保存其完整 VAD 片段。
 
 | 配置项 | 默认 | 调整建议 |
 | --- | --- | --- |
@@ -88,6 +90,8 @@ CLEANUP_INTERVAL_SECONDS=3600
 
 清理调度在 `collector` 中运行，**collector 停止期间不会清理**，下次启动时补清；每次删除失败会在日志报告，下轮重试。Docker 标准输出日志另行限制为每服务最多 3 份 × 10MB。
 
+升级后，collector 启动时会额外清理旧版本遗留的 `failed`、`empty`、`pending` 及无文本成功记录，同时删除对应 WAV 和原始 JSON；之后每轮清理也会重试。此规则独立于过期保留期限，即使 `RETENTION_DAYS=0`，无效历史录音也会被清理。网页会立即隐藏这些旧记录，无需等待文件清理完成。物理文件删除失败时保留隐藏记录以便重试。
+
 ## 数据位置与备份
 
 默认使用 Docker 命名卷 `rtsp-asr_asr_data`，两个服务共享数据，网页以只读方式挂载。容器内结构：
@@ -97,7 +101,7 @@ CLEANUP_INTERVAL_SECONDS=3600
   2026-10-26/
     records.sqlite3
     audio/meeting_09-30-00-000000_<UUID>.wav
-    raw_json/<UUID>.json                 # SAVE_RAW_JSON=true 才写入
+    raw_json/<UUID>.json                 # SAVE_RAW_JSON=true 且成功有文本才写入
     runtime/runtime_2026-10-26.log
     runtime/ffmpeg_2026-10-26.log
 ```
@@ -132,7 +136,7 @@ sudo chown 10001:10001 data
 | `ASR_WORKERS` / `QUEUE_SIZE` | `1` / `10` | 请求并发和内存队列上限 |
 | `ASR_CONNECT_TIMEOUT` / `ASR_TIMEOUT` | `10` / `180` | 连接、读取超时，秒 |
 | `ASR_RETRY_COUNT` | `2` | 首次失败后最多重试次数；网络失败会重建 Session |
-| `SAVE_RAW_JSON` | `false` | 是否额外保存完整接口响应 |
+| `SAVE_RAW_JSON` | `false` | 是否额外保存有效转写对应的完整接口响应 |
 | `FFMPEG_TIMEOUT` / `STALL_TIMEOUT` | `20` / `30` | FFmpeg TCP 超时、Python 无 PCM watchdog，秒 |
 | `RECONNECT_DELAY` | `5` | 断流重连间隔，秒 |
 | `STATUS_INTERVAL` | `60` | 拉流状态日志间隔，`0` 关闭 |
@@ -141,7 +145,7 @@ sudo chown 10001:10001 data
 
 默认请求 `verbose_json` 且 `enable_speaker_diarization=true`，需服务端支持；可用 `ASR_EXTRA_FORM` 覆盖。支持顶层或 `data` / `result` 中的 `text`、`segments`，空 segments 会回退到完整文本。说话人编号来自每次 ASR 返回，**不保证跨请求是同一个人**。时间戳保留原服务的秒/毫秒启发式兼容逻辑，默认按秒，明显超出片段时长的数值按毫秒解析。
 
-队列满时延续原脚本行为，丢弃最旧的**尚未进入 worker** 的片段并记录警告；这些片段没有保存。ASR 过慢时应提升服务速度或并发；本方案不保证拥塞、断流或强制退出时零丢失。SIGTERM 后会等待队列处理完，Compose 最多等待 2 分钟；如果已有大量慢请求，需要调大 `stop_grace_period`。已落盘但进程中断的 `pending` 记录会在下次启动时标记失败，保留音频，不自动重试历史失败项。
+队列满时延续原脚本行为，丢弃最旧的**尚未进入 worker** 的片段并记录警告；这些片段没有保存。ASR 过慢时应提升服务速度或并发；本方案不保证拥塞、断流或强制退出时零丢失。SIGTERM 后会等待队列处理完，Compose 最多等待 2 分钟；如果已有大量慢请求，需要调大 `stop_grace_period`。ASR 处理中尚未归档的音频仅在内存中，强制退出后无法恢复；失败请求在配置的重试次数耗尽后直接丢弃，不保存历史失败项。
 
 ## 本地开发与验证
 
@@ -167,6 +171,6 @@ python -X utf8 -m unittest discover -s tests -v
 docker compose --env-file .env.example config --no-env-resolution --quiet
 ```
 
-测试覆盖静音与短脉冲过滤、实际 VAD 的静音检测、长语音拆分与尾段、音频先落盘、ASR 成功/失败、分页搜索、Range 回放、导出、跨日归档、清理边界、重启状态恢复和认证。真实摄像头与 ASR 的识别效果、网络连通性仍需填写实际配置后验证。
+测试覆盖静音与短脉冲过滤、实际 VAD 的静音检测、长语音拆分与尾段、ASR 有文本后才落盘、失败/空白响应不保存、历史无效录音清理与删除重试、分页搜索、Range 回放、导出、跨日归档、清理边界和认证。真实摄像头与 ASR 的识别效果、网络连通性仍需填写实际配置后验证。
 
 旧脚本的 `transcription_logs` 不会自动迁移到网页索引。原脚本的转写 `.log` 已改为 SQLite 归档，需要纯文本时使用网页“导出当日文本”；旧运行日志目录如迁入新数据根目录，也会受日期清理策略影响。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RTSP speech collector: VAD -> durable WAV -> ASR -> daily SQLite records."""
+"""RTSP speech collector: VAD -> ASR -> archive only successful nonblank results."""
 import argparse
 import datetime as dt
 import io
@@ -100,15 +100,10 @@ def worker(worker_id, task_queue, args, extra_form):
     try:
         while True:
             task = task_queue.get()
-            record_id = None
             try:
                 if task is None:
                     return
                 sequence, chunk = task
-                day = chunk.started_at.date().isoformat()
-                record_id = store.begin(chunk.started_at, chunk.pcm, args.prefix)
-                if record_id is None:
-                    continue
                 form = {"model": args.model, "language": args.language, "response_format": "verbose_json",
                         "enable_speaker_diarization": "true", **extra_form}
                 last_error = ""
@@ -131,19 +126,18 @@ def worker(worker_id, task_queue, args, extra_form):
                         if attempt < args.retry_count:
                             time.sleep(min(2 ** attempt, 5))
                 else:
-                    store.finish(day, record_id, error=last_error)
-                    runtime_log(args.output_dir, f"[任务 {sequence}] 识别失败，音频已保留: {last_error}")
+                    runtime_log(args.output_dir, f"[任务 {sequence}] 识别失败，已丢弃音频: {last_error}")
+                    continue
+                if not segments:
+                    log_print(f"[任务 {sequence}] ASR 无有效文本，已丢弃音频")
                     continue
                 # Storage failures must not trigger duplicate ASR requests.
-                store.finish(day, record_id, segments=segments, payload=payload if args.save_json else None)
-                log_print(f"[任务 {sequence}] 保存 {chunk.duration:.2f}s 音频，识别 {len(segments)} 个片段")
+                record_id = store.save(chunk.started_at, chunk.pcm, segments, args.prefix,
+                                       payload=payload if args.save_json else None)
+                if record_id:
+                    log_print(f"[任务 {sequence}] 保存 {chunk.duration:.2f}s 音频，识别 {len(segments)} 个片段")
             except Exception as exc:
                 runtime_log(args.output_dir, f"ASR 工作线程 {worker_id} 异常: {type(exc).__name__}: {exc}")
-                if record_id:
-                    try:
-                        store.finish(day, record_id, error=redact(str(exc)))
-                    except Exception as storage_exc:
-                        log_print(f"更新失败状态异常: {storage_exc}")
             finally:
                 task_queue.task_done()
     finally:
@@ -170,6 +164,9 @@ def cleanup_loop(store, interval, stop_event):
             removed = store.cleanup()
             if removed:
                 log_print(f"[定时清理] 已删除日期目录: {', '.join(removed)}")
+            purged = store.purge_unrecognized()
+            if purged:
+                log_print(f"[定时清理] 已删除 {purged} 条未成功转写的历史录音")
         except Exception as exc:
             log_print(f"[定时清理] 失败，将在下轮重试: {exc}")
         stop_event.wait(interval)
@@ -186,7 +183,7 @@ def listen_rtsp(args, extra_form, stop_event=None):
     make_segmenter()
     store = Store(args.output_dir, args.retention_days)
     store.cleanup()
-    store.recover_pending()
+    store.purge_unrecognized()
     task_queue = queue.Queue(maxsize=args.queue_size)
     threads = [threading.Thread(target=worker, args=(i+1, task_queue, args, extra_form),
                                 name=f"asr-worker-{i+1}", daemon=True) for i in range(args.workers)]

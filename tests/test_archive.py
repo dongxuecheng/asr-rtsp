@@ -1,9 +1,11 @@
 import base64
+from contextlib import closing
 import datetime as dt
 import io
 import json
 from pathlib import Path
 import queue
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -78,19 +80,33 @@ class ArchiveTests(unittest.TestCase):
 
     def add(self, text="你好，测试归档", start=None):
         start = start or self.start
-        record_id = self.store.begin(start, self.pcm)
-        self.store.finish(start.date().isoformat(), record_id, [{"start":0.1,"end":0.9,"speaker":"speaker_0","text":text}])
-        return record_id
+        return self.store.save(start, self.pcm, [{"start":0.1,"end":0.9,"speaker":"speaker_0","text":text}])
 
-    def test_pending_audio_is_durable_before_asr(self):
-        record_id = self.store.begin(self.start, self.pcm)
+    def legacy(self, status, text=""):
+        record_id = self.add("旧记录")
         row = self.store.record(self.day, record_id)
-        self.assertEqual(row["status"], "pending")
+        with closing(sqlite3.connect(Path(self.temp.name)/self.day/"records.sqlite3")) as conn, conn:
+            conn.execute("UPDATE records SET status=?, text=?, segments='[]' WHERE id=?", (status,text,record_id))
+        raw = Path(self.temp.name)/self.day/"raw_json"
+        raw.mkdir(exist_ok=True)
+        (raw/f"{record_id}.json").write_text('{}')
+        return row
+
+    def test_valid_text_and_audio_are_saved_together(self):
+        record_id = self.add()
+        row = self.store.record(self.day, record_id)
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["text"], "你好，测试归档")
         with wave.open(str(Path(self.temp.name)/self.day/"audio"/row["audio_file"]), "rb") as wav:
             self.assertEqual((wav.getframerate(), wav.getnchannels(), wav.getsampwidth()), (16000,1,2))
             self.assertEqual(wav.readframes(16000), self.pcm)
-        self.store.recover_pending()
-        self.assertEqual(self.store.record(self.day, record_id)["status"], "failed")
+
+    def test_blank_text_is_not_saved(self):
+        for text in ("", " \n\t\r\u3000"):
+            self.assertIsNone(self.store.save(self.start,self.pcm,[{"text":text}],payload={"text":text}))
+        self.assertFalse(list(Path(self.temp.name).rglob("*.wav")))
+        self.assertFalse(list(Path(self.temp.name).rglob("*.json")))
+        self.assertEqual(self.store.days(),[])
 
     def test_query_pagination_export_and_range_audio(self):
         record_id = self.add("关键词 <script>alert('x')</script>")
@@ -116,27 +132,55 @@ class ArchiveTests(unittest.TestCase):
         self.assertNotEqual(a,b)
         self.assertEqual(len(list((Path(self.temp.name)/self.day/"audio").glob("*.wav"))),2)
 
-    def test_failed_and_empty_records_keep_audio(self):
-        failed = self.store.begin(self.start, self.pcm)
-        self.store.finish(self.day,failed,error="HTTP 503")
-        empty = self.store.begin(self.start, self.pcm)
-        self.store.finish(self.day,empty,[])
+    def test_legacy_invalid_records_are_hidden_and_purged(self):
+        rows = [self.legacy("failed","失败旧文本"), self.legacy("empty"),
+                self.legacy("pending"), self.legacy("done"," \n\t")]
         records = self.store.records(self.day)
-        self.assertEqual(records["summary"]["failed"],1)
-        self.assertEqual(records["summary"]["empty"],1)
-        for item in (failed,empty):
-            response = self.client.get(f"/api/audio/{self.day}/{item}")
-            self.assertEqual(response.status_code,200)
-            response.close()
+        self.assertEqual(records["summary"]["count"],0)
+        self.assertEqual(records["items"],[])
+        self.assertEqual(self.client.get("/api/days").json["days"],[])
+        self.assertEqual(self.client.get(f"/api/records?date={self.day}").json["items"],[])
+        exported = self.client.get(f"/api/export?date={self.day}").get_data(as_text=True)
+        self.assertNotIn("失败旧文本",exported)
+        self.assertNotIn("09:00:00",exported)
+        for row in rows:
+            self.assertEqual(self.client.get(f"/api/audio/{self.day}/{row['id']}").status_code,404)
+            self.assertNotIn(row["id"],exported)
+            self.assertIsNone(self.store.record(self.day,row["id"]))
+        self.assertEqual(self.store.purge_unrecognized(),4)
+        self.assertEqual(self.store._read(self.day,"SELECT id FROM records"),[])
+        self.assertFalse(list(Path(self.temp.name).rglob("*.wav")))
+        self.assertFalse(list(Path(self.temp.name).rglob("*.json")))
+
+    def test_purge_keeps_successful_records_and_runs_with_retention_off(self):
+        valid = self.add("保留有效内容")
+        self.legacy("failed")
+        store = Store(self.temp.name,retention_days=0)
+        self.assertEqual(store.cleanup(),[])
+        self.assertEqual(store.purge_unrecognized(),1)
+        self.assertEqual(store.days()[0]["count"],1)
+        self.assertEqual(store.records(self.day)["summary"]["duration"],1)
+        self.assertEqual(store.records(self.day)["summary"]["characters"],len("保留有效内容"))
+        response = self.client.get(f"/api/audio/{self.day}/{valid}")
+        self.assertEqual(response.status_code,200)
+        response.close()
+
+    def test_failed_file_deletion_stays_hidden_and_is_retried(self):
+        row = self.legacy("failed")
+        with patch("storage.Path.unlink",side_effect=PermissionError("busy")), self.assertLogs(level="ERROR"):
+            self.assertEqual(self.store.purge_unrecognized(),0)
+        self.assertIsNone(self.store.record(self.day,row["id"]))
+        self.assertEqual(self.store.days(),[])
+        self.assertEqual(self.store.purge_unrecognized(),1)
+        self.assertFalse(list(Path(self.temp.name).rglob("*.wav")))
 
     def test_expiration_boundary_and_complete_day_deletion(self):
         permanent = Store(self.temp.name,retention_days=0)
         expired_time = self.start-dt.timedelta(days=7)
         keep_time = self.start-dt.timedelta(days=6)
         expired_day = expired_time.date().isoformat()
-        expired_id = permanent.begin(expired_time,self.pcm)
-        permanent.finish(expired_day,expired_id,[],payload={"text":"old"})
-        permanent.begin(keep_time,self.pcm)
+        permanent.save(expired_time,self.pcm,[{"text":"old"}],payload={"text":"old"})
+        permanent.save(keep_time,self.pcm,[{"text":"keep"}])
         runtime = Path(self.temp.name)/expired_day/"runtime"
         runtime.mkdir()
         (runtime/"old.log").write_text("old")
@@ -147,9 +191,8 @@ class ArchiveTests(unittest.TestCase):
         self.assertFalse((Path(self.temp.name)/expired_day).exists())
         self.assertTrue((Path(self.temp.name)/keep_time.date().isoformat()).exists())
         self.assertTrue(unrelated.exists())
-        self.assertIsNone(self.store.begin(expired_time,self.pcm))
-        # An in-flight ASR result must not recreate a deleted archive day.
-        self.store.finish(expired_day,expired_id,segments=[])
+        # A late ASR result must not recreate a deleted archive day.
+        self.assertIsNone(self.store.save(expired_time,self.pcm,[{"text":"late"}]))
         self.assertFalse((Path(self.temp.name)/expired_day).exists())
 
     def test_date_changes_at_midnight(self):
@@ -186,6 +229,8 @@ class ArchiveTests(unittest.TestCase):
             def json(self): return {"text":"通过模拟 ASR"}
         class Session:
             def post(inner,*args,**kwargs):
+                self.assertFalse(list(Path(self.temp.name).rglob("*.wav")))
+                self.assertEqual(self.store.days(),[])
                 self.assertEqual(kwargs["files"]["file"][1].read(4),b"RIFF")
                 self.assertEqual(kwargs["data"]["response_format"],"verbose_json")
                 return Response()
@@ -197,7 +242,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(records[0]["status"],"done")
         self.assertEqual(len(list((Path(self.temp.name)/self.day/"raw_json").glob("*.json"))),1)
 
-    def test_worker_failure_is_visible(self):
+    def test_worker_failure_does_not_save_audio_or_records(self):
         args = parse_args(["rtsp://example/stream","--output-dir",self.temp.name,"--retry-count","0"])
         tasks = queue.Queue()
         tasks.put((1,SpeechChunk(self.start,self.pcm)))
@@ -207,7 +252,49 @@ class ArchiveTests(unittest.TestCase):
             def close(self): pass
         with patch("rtsp_asr_save_audio.new_http_session",return_value=Session()):
             worker(1,tasks,args,{})
-        self.assertEqual(self.store.records(self.day)["items"][0]["status"],"failed")
+        self.assertEqual(self.store.records(self.day)["items"],[])
+        self.assertFalse(list(Path(self.temp.name).rglob("*.wav")))
+
+    def test_worker_empty_or_invalid_responses_are_not_saved(self):
+        args = parse_args(["rtsp://example/stream","--output-dir",self.temp.name,"--retry-count","0","--save-json"])
+        cases = [(200,p) for p in ({}, {"text":" \n\t\u3000"}, {"segments":[{"text":""}]}, {"data":{"text":""}}, [])]
+        cases.append((503,{"text":"错误响应中的文本不能保存"}))
+        for status,payload in cases:
+            with self.subTest(status=status,payload=payload):
+                tasks = queue.Queue()
+                tasks.put((1,SpeechChunk(self.start,self.pcm)))
+                tasks.put(None)
+                response = Mock()
+                response.status_code = status
+                response.text = "service unavailable"
+                response.json.return_value = payload
+                response.__enter__ = Mock(return_value=response)
+                response.__exit__ = Mock(return_value=False)
+                session = Mock()
+                session.post.return_value = response
+                with patch("rtsp_asr_save_audio.new_http_session",return_value=session):
+                    worker(1,tasks,args,{})
+                self.assertEqual(self.store.records(self.day)["items"],[])
+                self.assertFalse(list(Path(self.temp.name).rglob("*.wav")))
+                self.assertFalse(list(Path(self.temp.name).rglob("*.json")))
+
+    def test_retry_success_saves_only_the_successful_result(self):
+        args = parse_args(["rtsp://example/stream","--output-dir",self.temp.name,"--retry-count","1"])
+        tasks = queue.Queue()
+        tasks.put((1,SpeechChunk(self.start,self.pcm)))
+        tasks.put(None)
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"text":"重试成功"}
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        session = Mock()
+        session.post.side_effect = [requests.Timeout("retry"),response]
+        with patch("rtsp_asr_save_audio.new_http_session",return_value=session), patch("rtsp_asr_save_audio.time.sleep"):
+            worker(1,tasks,args,{})
+        self.assertEqual(session.post.call_count,2)
+        self.assertEqual(self.store.records(self.day)["items"][0]["text"],"重试成功")
+        self.assertEqual(len(list(Path(self.temp.name).rglob("*.wav"))),1)
 
 
 class UtilityTests(unittest.TestCase):

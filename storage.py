@@ -14,6 +14,7 @@ import wave
 
 STORAGE_LOCK = threading.RLock()
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+VISIBLE_RECORD_SQL = "status='done' AND length(trim(text, char(9)||char(10)||char(13)||' ')) > 0"
 
 
 def valid_day(value):
@@ -38,7 +39,13 @@ class Store:
             raise ValueError("无效的数据目录")
         return directory
 
-    def begin(self, started_at, pcm, prefix="meeting"):
+    def save(self, started_at, pcm, segments, prefix="meeting", payload=None):
+        """Persist only a successful ASR result with nonblank text and its audio."""
+        segments = [{**s, "text": s["text"].strip()} for s in segments
+                    if isinstance(s.get("text"), str) and s["text"].strip()]
+        if not segments:
+            return None
+        text = "\n".join(s["text"] for s in segments)
         day = started_at.date().isoformat()
         with STORAGE_LOCK:
             if self.expired(day):
@@ -63,37 +70,62 @@ class Store:
                         audio_file TEXT NOT NULL, status TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
                         segments TEXT NOT NULL DEFAULT '[]', error TEXT NOT NULL DEFAULT '')""")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_started ON records(started_at, id)")
-                    conn.execute("INSERT INTO records(id, started_at, duration, audio_file, status) VALUES(?,?,?,?,?)",
-                                 (record_id, started_at.isoformat(timespec="milliseconds"), len(pcm)/32000, filename, "pending"))
+                    conn.execute("INSERT INTO records(id, started_at, duration, audio_file, status, text, segments) VALUES(?,?,?,?,?,?,?)",
+                                 (record_id, started_at.isoformat(timespec="milliseconds"), len(pcm)/32000,
+                                  filename, "done", text, json.dumps(segments, ensure_ascii=False)))
             except Exception:
                 temporary.unlink(missing_ok=True)
                 audio_file.unlink(missing_ok=True)
                 raise
-            return record_id
-
-    def finish(self, day, record_id, segments=None, error="", payload=None):
-        with STORAGE_LOCK:
-            if self.expired(day) or not record_id:
-                return
-            segments = segments or []
-            text = "\n".join(s["text"] for s in segments)
-            status = "failed" if error else ("done" if text else "empty")
-            directory = self.day_dir(day)
-            with closing(sqlite3.connect((directory / "records.sqlite3").as_uri()+"?mode=rw", uri=True, timeout=10)) as conn, conn:
-                conn.execute("UPDATE records SET status=?, text=?, segments=?, error=? WHERE id=?",
-                             (status, text, json.dumps(segments, ensure_ascii=False), error, record_id))
             if payload is not None:
                 raw_dir = directory / "raw_json"
-                raw_dir.mkdir(exist_ok=True)
                 target = raw_dir / f"{record_id}.json"
                 temp = target.with_suffix(".tmp")
                 try:
+                    raw_dir.mkdir(exist_ok=True)
                     temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
                     os.replace(temp, target)
                 except OSError:
                     logging.exception("保存原始 ASR JSON 失败；已归档的文本和音频仍保留")
                 finally:
                     temp.unlink(missing_ok=True)
+            return record_id
+
+    def _discard_unrecognized(self, day, record_id):
+        """Remove files before the row, so interrupted purges remain retryable."""
+        try:
+            directory = self.day_dir(day)
+            rows = self._read(day, f"SELECT audio_file FROM records WHERE id=? AND NOT ({VISIBLE_RECORD_SQL})", (record_id,))
+            if not rows:
+                return True
+            audio_dir = directory / "audio"
+            filename = rows[0]["audio_file"]
+            audio = audio_dir / filename
+            raw_dir = directory / "raw_json"
+            if (not re.fullmatch(r"[0-9a-f]{32}", record_id)
+                    or Path(filename).name != filename
+                    or audio_dir.is_symlink() or audio_dir.resolve().parent != directory
+                    or audio.resolve().parent != audio_dir.resolve()
+                    or raw_dir.is_symlink() or raw_dir.resolve().parent != directory):
+                raise ValueError("拒绝清理数据目录之外的音频或响应文件")
+            audio.unlink(missing_ok=True)
+            (raw_dir / f"{record_id}.json").unlink(missing_ok=True)
+            (raw_dir / f"{record_id}.tmp").unlink(missing_ok=True)
+            with closing(sqlite3.connect((directory / "records.sqlite3").as_uri()+"?mode=rw", uri=True, timeout=10)) as conn, conn:
+                conn.execute(f"DELETE FROM records WHERE id=? AND NOT ({VISIBLE_RECORD_SQL})", (record_id,))
+            return True
+        except (OSError, ValueError, sqlite3.Error):
+            logging.exception("删除未成功转写的录音失败，记录已隐藏，将在后续清理时重试：%s/%s", day, record_id)
+            return False
+
+    def purge_unrecognized(self):
+        """Purge legacy failed, pending and empty records, even with retention off."""
+        removed = 0
+        with STORAGE_LOCK:
+            for day in self._day_names():
+                for row in self._read(day, f"SELECT id FROM records WHERE NOT ({VISIBLE_RECORD_SQL})"):
+                    removed += int(self._discard_unrecognized(day, row["id"]))
+        return removed
 
     def _read(self, day, query, parameters=()):
         database = self.day_dir(day) / "records.sqlite3"
@@ -109,7 +141,7 @@ class Store:
                 return []
             raise
 
-    def days(self):
+    def _day_names(self):
         if not self.root.exists():
             return []
         result = []
@@ -119,32 +151,33 @@ class Store:
                     valid_day(folder.name)
                 except ValueError:
                     continue
-                rows = self._read(folder.name, "SELECT count(*) AS count, coalesce(sum(duration),0) AS duration FROM records")
-                if rows and rows[0]["count"]:
-                    result.append({"date": folder.name, **rows[0]})
+                result.append(folder.name)
+        return result
+
+    def days(self):
+        result = []
+        for day in self._day_names():
+            rows = self._read(day, f"SELECT count(*) AS count, coalesce(sum(duration),0) AS duration FROM records WHERE {VISIBLE_RECORD_SQL}")
+            if rows and rows[0]["count"]:
+                result.append({"date": day, **rows[0]})
         return result
 
     def records(self, day, query="", limit=50, offset=0):
-        where = "WHERE instr(lower(text),lower(?)) > 0" if query else ""
+        where = f"WHERE {VISIBLE_RECORD_SQL}"
+        if query:
+            where += " AND instr(lower(text),lower(?)) > 0"
         params = (query,) if query else ()
         summary = self._read(day, f"""SELECT count(*) AS count, coalesce(sum(duration),0) AS duration,
-            coalesce(sum(status='failed'),0) AS failed, coalesce(sum(status='pending'),0) AS pending,
-            coalesce(sum(status='empty'),0) AS empty FROM records {where}""", params)
+            coalesce(sum(length(text)),0) AS characters
+            FROM records {where}""", params)
         rows = self._read(day, f"SELECT * FROM records {where} ORDER BY started_at, id LIMIT ? OFFSET ?", (*params, limit, offset))
         for row in rows:
             row["segments"] = json.loads(row["segments"])
-        return {"items": rows, "summary": summary[0] if summary else {"count":0,"duration":0,"failed":0,"pending":0,"empty":0}}
+        return {"items": rows, "summary": summary[0] if summary else {"count":0,"duration":0,"characters":0}}
 
     def record(self, day, record_id):
-        rows = self._read(day, "SELECT * FROM records WHERE id=?", (record_id,))
+        rows = self._read(day, f"SELECT * FROM records WHERE id=? AND {VISIBLE_RECORD_SQL}", (record_id,))
         return rows[0] if rows else None
-
-    def recover_pending(self):
-        with STORAGE_LOCK:
-            for day in self.days():
-                database = self.day_dir(day["date"]) / "records.sqlite3"
-                with closing(sqlite3.connect(database, timeout=10)) as conn, conn:
-                    conn.execute("UPDATE records SET status='failed', error='采集进程上次退出，识别未完成；音频已保留' WHERE status='pending'")
 
     def cleanup(self, today=None):
         removed = []

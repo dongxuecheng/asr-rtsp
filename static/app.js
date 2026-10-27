@@ -2,7 +2,6 @@
 const $ = id => document.getElementById(id);
 let selectedDate = "", query = "", page = 1, total = 0, requestId = 0;
 const limit = 50;
-const statuses = {done:"已转写", failed:"识别失败 · 音频已保留", pending:"识别中", empty:"未识别到文本"};
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -27,7 +26,7 @@ function buildRecord(record) {
   time.append(el("small", "", duration(record.duration)));
   const card = el("div", "card");
   const top = el("div", "card-top");
-  top.append(el("span", `status ${record.status}`, statuses[record.status] || record.status), el("span", "record-id", record.id.slice(0,8)));
+  top.append(el("span", "status", "已转写"), el("span", "record-id", record.id.slice(0,8)));
   card.append(top);
   const audio = el("audio");
   audio.controls = true;
@@ -55,7 +54,7 @@ function buildRecord(record) {
     }
     card.append(segments);
   } else {
-    card.append(el("p", `record-note ${record.error ? "error" : ""}`, record.error || (record.status === "pending" ? "正在等待 ASR 返回结果，音频已经保存。" : "检测到声音，但 ASR 没有返回有效文本。")));
+    card.append(el("p", "record-note", record.text));
   }
   const player = el("div", "player"), download = el("a", "", "下载 WAV ↗");
   download.href = record.audio_url;
@@ -97,15 +96,14 @@ async function refresh() {
     if (page > 1 && (page-1)*limit >= total) {page = Math.max(1, Math.ceil(total/limit)); return refresh();}
     $("total").textContent = total;
     $("duration").textContent = duration(data.summary.duration);
-    $("failed").textContent = data.summary.failed;
-    $("pending").textContent = `${data.summary.pending} 条识别中 · ${data.summary.empty} 条无文本`;
+    $("characters").textContent = data.summary.characters;
     $("scope").textContent = query ? `关键词「${query}」的结果` : "当日全部记录";
     $("listTitle").textContent = `${selectedDate} 的记录`;
     $("pageInfo").textContent = `${page} / ${Math.max(1, Math.ceil(total/limit))} 页`;
     $("export").href = `/api/export?${new URLSearchParams({date:selectedDate})}`;
     $("notice").hidden = data.items.length > 0;
     $("notice").className = "";
-    $("notice").textContent = query ? "没有找到匹配的内容，请尝试其他关键词。" : "这一天还没有语音记录。采集到有效人声后，记录会显示在这里。";
+    $("notice").textContent = query ? "没有找到匹配的内容，请尝试其他关键词。" : "这一天还没有有效转写记录。识别成功且有文本的录音会显示在这里。";
     $("records").replaceChildren(...data.items.map(buildRecord));
     $("prev").disabled = page <= 1;
     $("next").disabled = page*limit >= total;

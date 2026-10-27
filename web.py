@@ -9,7 +9,7 @@ import sqlite3
 
 from flask import Flask, Response, abort, jsonify, request, send_file
 
-from storage import Store, valid_day
+from storage import Store, valid_day, VISIBLE_RECORD_SQL
 
 
 def create_app(config=None):
@@ -110,7 +110,7 @@ def create_app(config=None):
     @app.get("/api/export")
     def export():
         day = day_arg()
-        rows = store._read(day, "SELECT * FROM records ORDER BY started_at, id")
+        rows = store._read(day, f"SELECT * FROM records WHERE {VISIBLE_RECORD_SQL} ORDER BY started_at, id")
         lines = [f"{day} ASR 记录（{app.config['ARCHIVE_TIMEZONE']}）\n"]
         for row in rows:
             lines.append(f"\n[{row['started_at'].replace('T', ' ')}] {row['duration']:.2f}s · {row['status']}\n")
@@ -118,10 +118,6 @@ def create_app(config=None):
                 for segment in json.loads(row["segments"]):
                     started = dt.datetime.fromisoformat(row["started_at"]) + dt.timedelta(seconds=segment["start"])
                     lines.append(f"[{started:%H:%M:%S}] [{segment['speaker']}] {segment['text']}\n")
-            elif row["error"]:
-                lines.append(f"识别失败：{row['error']}\n")
-            else:
-                lines.append("识别中\n" if row["status"] == "pending" else "未识别到文本\n")
         return Response("".join(lines), mimetype="text/plain", headers={"Content-Disposition": f'attachment; filename="asr_{day}.txt"'})
 
     return app
