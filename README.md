@@ -15,7 +15,7 @@
 | `speech.py` | 30ms WebRTC VAD、人声切段、样本时间轴、无 audioop 的 RMS |
 | `storage.py` | 每日 SQLite、有效转写与 WAV 归档、历史无效录音与过期目录清理 |
 | `web.py`、`static/` | Flask 只读 API、每日档案页面 |
-| `Dockerfile`、`compose.yaml` | 采集与网页两个服务、共享持久卷、日志轮转 |
+| `Dockerfile`、`compose.yaml` | 采集与网页服务、项目 data/ 目录挂载、目录权限初始化、日志轮转 |
 
 数据流：`RTSP → FFmpeg 16kHz 单声道 PCM → VAD → ASR 队列 → 内存中请求 ASR → 成功且有文本 → WAV + SQLite`。识别失败或无文本的片段直接丢弃，不写入录音、原始 JSON 或记录。
 
@@ -94,36 +94,44 @@ CLEANUP_INTERVAL_SECONDS=3600
 
 ## 数据位置与备份
 
-默认使用 Docker 命名卷 `rtsp-asr_asr_data`，两个服务共享数据，网页以只读方式挂载。容器内结构：
+默认直接保存到**项目目录下的 `data/`**（与 `compose.yaml` 同级）。采集器把这里挂载到容器内的 `/data`，网页只读挂载同一个目录。在 Windows 项目路径 `D:\code\asr-rtsp` 中部署时，实际文件位于 `D:\code\asr-rtsp\data`；在 Linux 服务器上则位于该服务器的项目目录中。
+
+文件结构：
 
 ```text
-/data/
-  2026-10-26/
-    records.sqlite3
+项目目录/data/
+  2026-10-28/
+    records.sqlite3                     # ASR 文本、说话人、时间及音频文件名
     audio/meeting_09-30-00-000000_<UUID>.wav
     raw_json/<UUID>.json                 # SAVE_RAW_JSON=true 且成功有文本才写入
-    runtime/runtime_2026-10-26.log
-    runtime/ffmpeg_2026-10-26.log
+    runtime/runtime_2026-10-28.log
+    runtime/ffmpeg_2026-10-28.log
 ```
 
-停止和重建容器不会删除数据卷。不要用 `docker compose down -v` 来日常停止服务，因为 `-v` 会删除卷。
+音频是独立 WAV 文件，ASR 内容保存在每日 SQLite 数据库中。`data/` 自动创建，`data-init` 初始化服务负责把目录及已有文件的所有者设置为容器 UID/GID `10001:10001`，之后采集和网页服务仍以普通用户运行；Linux 服务器上无需另行手工 chown。目录中的文件可在宿主机查看、复制，停止或重建容器不会删除它们，过期清理仍按 `.env` 执行。
 
-导出整个数据目录前暂停采集，确保数据库文件一致：
+`data/` 已被 Git 和 Docker 构建忽略，不会随代码上传 GitHub 或打包进镜像。容器的 `DATA_DIR=/data` 是挂载路径，不需要在 `.env` 中修改它。首次启动但尚无成功转写时，可能还没有日期数据库或 WAV 文件。
+
+备份时先停止采集，再复制项目中的整个 `data/` 文件夹，避免复制到正在写入的数据库：
 
 ```sh
 docker compose stop collector
-docker compose cp collector:/data ./archive-backup
+# 将项目的 data/ 文件夹复制到备份位置
 docker compose start collector
 ```
 
-希望文件直接落到服务器 `./data` 时，可把两个服务的卷分别改为 `./data:/data` 和 `./data:/data:ro`。Linux 上先创建目录并授权容器 UID：
+从旧版命名卷升级且希望保留历史数据时，**在重建旧容器之前**执行下面步骤；`data/` 应为空目录或尚不存在：
 
 ```sh
-mkdir -p data
-sudo chown 10001:10001 data
+docker compose stop collector web
+docker compose cp collector:/data/. ./data
+git pull
+docker compose up -d --build
 ```
 
-只运行一个 collector 写入同一数据目录；多个 RTSP 源应使用不同 Compose 项目名和独立数据卷。
+复制命令从旧采集容器的 `/data` 读取历史文件，不会删除旧卷；升级不会自动迁移已有命名卷。如果已经重建了容器，旧卷 `rtsp-asr_asr_data` 仍在，需另行从旧卷恢复数据。首次安装或不需要旧数据时，直接执行 `docker compose up -d --build` 即可。
+
+只运行一个 collector 写入同一数据目录；多个 RTSP 源应使用不同项目目录或独立的 data/ 挂载路径，单独修改 Compose 项目名不会改变 `./data` 的位置。
 
 ## ASR 与运行配置
 

@@ -15,19 +15,34 @@ x-common: &common
       max-file: "3"
 
 services:
+  # Prepare bind-mount permissions so the collector can keep running as UID 10001.
+  data-init:
+    <<: *common
+    user: "0:0"
+    restart: "no"
+    command: ["chown", "-hR", "10001:10001", "/data"]
+    volumes:
+      - ./data:/data
+
   collector:
     <<: *common
     command: ["python", "rtsp_asr_save_audio.py"]
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
     volumes:
-      - asr_data:/data
+      - ./data:/data
     # SIGTERM stops reading, then drains queued tasks. Forced termination still leaves WAVs.
     stop_grace_period: 2m
 
   web:
     <<: *common
     command: ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "4", "--access-logfile", "-", "web:create_app()"]
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
     volumes:
-      - asr_data:/data:ro
+      - ./data:/data:ro
     ports:
       - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8080}:8080"
     healthcheck:
@@ -36,6 +51,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-
-volumes:
-  asr_data:
