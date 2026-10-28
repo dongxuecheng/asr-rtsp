@@ -1,6 +1,7 @@
 """Per-day SQLite, WAV and UTF-8 transcript storage; read-only web readers."""
 from contextlib import closing
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
@@ -253,13 +254,30 @@ class Store:
         if query:
             where += " AND instr(lower(text),lower(?)) > 0"
         params = (query,) if query else ()
-        summary = self._read(day, f"""SELECT count(*) AS count, coalesce(sum(duration),0) AS duration,
-            coalesce(sum(length(text)),0) AS characters
-            FROM records {where}""", params)
-        rows = self._read(day, f"SELECT * FROM records {where} ORDER BY started_at, id LIMIT ? OFFSET ?", (*params, limit, offset))
+        if limit is None:
+            rows = self._read(day, f"SELECT * FROM records {where} ORDER BY started_at, id", params)
+            summary = [{"count":len(rows), "duration":sum(r["duration"] for r in rows),
+                        "characters":sum(len(r["text"]) for r in rows)}]
+        else:
+            summary = self._read(day, f"""SELECT count(*) AS count, coalesce(sum(duration),0) AS duration,
+                coalesce(sum(length(text)),0) AS characters
+                FROM records {where}""", params)
+            rows = self._read(day, f"SELECT * FROM records {where} ORDER BY started_at, id LIMIT ? OFFSET ?", (*params, limit, offset))
         for row in rows:
             row["segments"] = json.loads(row["segments"])
         return {"items": rows, "summary": summary[0] if summary else {"count":0,"duration":0,"characters":0}}
+
+    def records_revision(self, day, query=""):
+        """Cheap conditional-poll token; include WAL metadata if enabled later."""
+        directory = self.day_dir(day)
+        signature = [day, query]
+        for filename in ("records.sqlite3", "records.sqlite3-wal"):
+            try:
+                stat = (directory / filename).stat()
+                signature.append((stat.st_ino, stat.st_size, stat.st_mtime_ns))
+            except FileNotFoundError:
+                signature.append(None)
+        return hashlib.sha256(repr(signature).encode("utf-8")).hexdigest()
 
     def record(self, day, record_id):
         rows = self._read(day, f"SELECT * FROM records WHERE id=? AND {VISIBLE_RECORD_SQL}", (record_id,))

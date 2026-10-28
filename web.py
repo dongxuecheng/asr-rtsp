@@ -65,12 +65,17 @@ def create_app(config=None):
 
     @app.get("/api/days")
     def days():
-        return jsonify(days=store.days(), today=dt.date.today().isoformat(),
+        now = dt.datetime.now()
+        return jsonify(days=store.days(), today=now.date().isoformat(), checked_at=now.strftime("%H:%M:%S"),
                        retention_days=app.config["RETENTION_DAYS"], timezone=app.config["ARCHIVE_TIMEZONE"])
 
     @app.get("/api/records")
     def records():
         day = day_arg()
+        query = request.args.get("q", "")[:500]
+        all_records = request.args.get("all", "0")
+        if all_records not in ("0", "1"):
+            abort(400, description="all 参数应为 0 或 1")
         try:
             page = int(request.args.get("page", "1"))
             limit = int(request.args.get("limit", "50"))
@@ -78,11 +83,22 @@ def create_app(config=None):
             abort(400, description="分页参数应为整数")
         if page < 1 or not 1 <= limit <= 200:
             abort(400, description="page 应大于 0，limit 应在 1～200 之间")
-        result = store.records(day, request.args.get("q", "")[:500], limit, (page-1)*limit)
+        revision = None
+        if all_records == "1":
+            revision = store.records_revision(day, query)
+            if request.if_none_match.contains(revision):
+                response = Response(status=304)
+                response.set_etag(revision)
+                return response
+        result = store.records(day, query, None if all_records == "1" else limit, (page-1)*limit)
         for row in result["items"]:
             row.pop("audio_file", None)
             row["audio_url"] = f"/api/audio/{day}/{row['id']}"
-        return jsonify(date=day, page=page, limit=limit, **result)
+        response = jsonify(date=day, page=1 if all_records == "1" else page,
+                           limit=None if all_records == "1" else limit, **result)
+        if revision:
+            response.set_etag(revision)
+        return response
 
     @app.get("/api/audio/<day>/<record_id>")
     def audio(day, record_id):

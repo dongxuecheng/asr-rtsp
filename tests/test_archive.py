@@ -179,6 +179,51 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(audio.data[:4],b"RIFF")
         audio.close()
 
+    def test_full_day_feed_includes_more_than_fifty_records(self):
+        for index in range(65):
+            self.add(f"第{index:03d}条有效转写",start=self.start+dt.timedelta(seconds=index))
+        response = self.client.get(f"/api/records?date={self.day}&all=1")
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(len(response.json["items"]),65)
+        self.assertEqual(response.json["summary"]["count"],65)
+        self.assertIsNone(response.json["limit"])
+        self.assertEqual(response.json["items"][-1]["text"],"第064条有效转写")
+        self.assertEqual(len(self.client.get(f"/api/records?date={self.day}").json["items"]),50)
+        found = self.client.get("/api/records",query_string={"date":self.day,"all":1,"q":"第064"})
+        self.assertEqual(len(found.json["items"]),1)
+        self.assertEqual(found.json["summary"]["count"],1)
+
+    def test_full_day_feed_skips_unchanged_and_detects_new_results(self):
+        self.add("初始转写")
+        url = f"/api/records?date={self.day}&all=1"
+        initial = self.client.get(url)
+        token = initial.headers["ETag"]
+        with patch.object(Store,"records",side_effect=AssertionError("unchanged feed must not reload records")):
+            same = self.client.get(url,headers={"If-None-Match":token})
+        self.assertEqual(same.status_code,304)
+        self.assertEqual(same.data,b"")
+        self.add("新到达的转写",start=self.start+dt.timedelta(seconds=5))
+        changed = self.client.get(url,headers={"If-None-Match":token})
+        self.assertEqual(changed.status_code,200)
+        self.assertNotEqual(changed.headers["ETag"],token)
+        self.assertEqual(changed.json["summary"]["count"],2)
+        other_query = self.client.get(url+"&q=没有匹配",headers={"If-None-Match":changed.headers["ETag"]})
+        self.assertEqual(other_query.status_code,200)
+        self.assertEqual(other_query.json["items"],[])
+
+    def test_full_day_feed_updates_when_day_is_created_or_deleted(self):
+        url = f"/api/records?date={self.day}&all=1"
+        empty = self.client.get(url)
+        self.assertEqual(empty.json["items"],[])
+        self.add("新增日期的转写")
+        created = self.client.get(url,headers={"If-None-Match":empty.headers["ETag"]})
+        self.assertEqual(created.status_code,200)
+        self.assertEqual(created.json["summary"]["count"],1)
+        self.store.cleanup(today=self.start.date()+dt.timedelta(days=7))
+        removed = self.client.get(url,headers={"If-None-Match":created.headers["ETag"]})
+        self.assertEqual(removed.status_code,200)
+        self.assertEqual(removed.json["items"],[])
+
     def test_restart_does_not_overwrite_files(self):
         a, b = self.add(), self.add()
         self.assertNotEqual(a,b)
@@ -262,7 +307,7 @@ class ArchiveTests(unittest.TestCase):
     def test_validation_and_no_path_traversal(self):
         for value in ("../../other", "2026-02-30", "2026-1-1"):
             self.assertEqual(self.client.get("/api/records",query_string={"date":value}).status_code,400)
-        for query in ("page=0","page=x","limit=999","limit=-1"):
+        for query in ("page=0","page=x","limit=999","limit=-1","all=2"):
             self.assertEqual(self.client.get(f"/api/records?{query}").status_code,400)
         self.assertEqual(self.client.get(f"/api/audio/{self.day}/anything").status_code,404)
 

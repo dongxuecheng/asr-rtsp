@@ -1,128 +1,199 @@
 "use strict";
 const $ = id => document.getElementById(id);
-let selectedDate = "", query = "", page = 1, total = 0, requestId = 0;
-const limit = 50;
+let selectedDate = "", serverToday = "", followingToday = true, query = "";
+let requestId = 0, activeRequest = null, etag = null, fetchedKey = "";
+let renderedKey = "", rendered = new Map(), unseen = 0, daySignature = "";
+
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
 }
-function duration(seconds) {
-  const n = Math.round(seconds);
-  return n < 60 ? `${n} 秒` : `${Math.floor(n/60)} 分 ${n%60} 秒`;
-}
-async function get(url) {
-  const response = await fetch(url, {cache:"no-store"});
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
-    throw new Error(error.error || `读取失败 (${response.status})`);
-  }
-  return response.json();
+function clock(startedAt, offset=0) {
+  // Treat the server's local clock as a civil time, without browser TZ conversion.
+  const time = Date.parse(startedAt.slice(0,23) + "Z") + offset*1000;
+  return Number.isFinite(time) ? new Date(time).toISOString().slice(11,19) : startedAt.slice(11,19);
 }
 function buildRecord(record) {
   const article = el("article", "record");
-  const time = el("div", "time", record.started_at.slice(11,19));
-  time.append(el("small", "", duration(record.duration)));
+  article.dataset.recordId = record.id;
+  const time = el("time", "time", clock(record.started_at));
+  time.dateTime = record.started_at;
   const card = el("div", "card");
-  const top = el("div", "card-top");
-  top.append(el("span", "status", "已转写"), el("span", "record-id", record.id.slice(0,8)));
-  card.append(top);
-  const audio = el("audio");
-  audio.controls = true;
-  audio.preload = "none";
-  audio.src = record.audio_url;
-  audio.setAttribute("aria-label", `${record.started_at} 的录音`);
-  audio.addEventListener("play", () => {
-    document.querySelectorAll("audio").forEach(other => { if(other !== audio) other.pause(); });
-  });
-  if (record.segments.length) {
-    const segments = el("div", "segments");
-    for (const item of record.segments) {
-      const line = el("div", "segment"), speaker = el("div", "speaker", item.speaker);
-      const jump = el("button", "jump", `▶ +${item.start.toFixed(1)}s`);
-      jump.type = "button";
-      jump.setAttribute("aria-label", `播放 ${item.speaker} 在 ${item.start.toFixed(1)} 秒的语音`);
-      jump.addEventListener("click", () => {
-        const play = () => {audio.currentTime = item.start; audio.play().catch(() => {});};
-        if (audio.readyState >= 1) play();
-        else {audio.addEventListener("loadedmetadata", play, {once:true}); audio.load();}
-      });
-      speaker.append(jump);
-      line.append(speaker, el("p", "", item.text));
-      segments.append(line);
-    }
-    card.append(segments);
-  } else {
-    card.append(el("p", "record-note", record.text));
+  const segments = record.segments.length ? record.segments : [{speaker:"未知说话人",start:0,text:record.text}];
+  for (const item of segments) {
+    const line = el("div", "segment");
+    const meta = el("div", "segment-meta");
+    meta.append(el("span", "speaker", item.speaker || "未知说话人"),
+                el("span", "segment-time", clock(record.started_at, item.start || 0)));
+    line.append(meta, el("p", "", item.text));
+    card.append(line);
   }
-  const player = el("div", "player"), download = el("a", "", "下载 WAV ↗");
-  download.href = record.audio_url;
-  download.download = "";
-  player.append(audio, download);
-  card.append(player);
   article.append(time, card);
   return article;
 }
-async function refreshDays() {
-  const data = await get("/api/days");
-  if (!selectedDate) {
-    selectedDate = data.today;
+function nearBottom() {
+  return window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 150;
+}
+function clearUnseen() {
+  unseen = 0;
+  $("newResults").hidden = true;
+}
+function scrollToLatest() {
+  $("follow").checked = true;
+  window.scrollTo({top:document.documentElement.scrollHeight,behavior:"auto"});
+  clearUnseen();
+}
+function resetView() {
+  etag = null;
+  fetchedKey = "";
+  renderedKey = "";
+  rendered.clear();
+  $("records").replaceChildren();
+  for (const id of ["total","characters","latest"]) $(id).textContent = "—";
+  $("notice").hidden = false;
+  $("notice").className = "";
+  $("notice").textContent = "正在读取转写内容…";
+  clearUnseen();
+}
+function changeDay(day, follow=day === serverToday) {
+  if (day !== selectedDate) resetView();
+  selectedDate = day;
+  followingToday = follow;
+  $("date").value = day;
+  refresh(true);
+}
+function showMeta(data) {
+  serverToday = data.today;
+  if (!selectedDate || (followingToday && selectedDate !== serverToday)) {
+    resetView();
+    selectedDate = serverToday;
     $("date").value = selectedDate;
   }
   $("timezone").textContent = data.timezone;
-  $("retention").textContent = data.retention_days ? `按采集端日期保留最近 ${data.retention_days} 天（含今天）。到期文本、录音与日志会自动清理。` : "自动清理已关闭，历史文本与录音持续保留。";
+  $("today").classList.toggle("selected", followingToday);
+  $("retention").textContent = data.retention_days ? `保留最近 ${data.retention_days} 天（含今天）。到期文本、录音与日志自动清理。` : "历史文本与录音持续保留，自动过期清理已关闭。";
   $("dayCount").textContent = `${data.days.length} 天`;
+  const signature = JSON.stringify([selectedDate,data.days]);
+  if (signature === daySignature) return;
+  daySignature = signature;
   const fragment = document.createDocumentFragment();
   for (const day of data.days) {
     const button = el("button", `day ${day.date === selectedDate ? "active" : ""}`);
     button.type = "button";
-    button.setAttribute("aria-current", day.date === selectedDate ? "date" : "false");
-    button.append(el("span", "", day.date), el("small", "", `${day.count} 条`));
-    button.addEventListener("click", () => {selectedDate = day.date; $("date").value = selectedDate; page = 1; refresh();});
+    button.setAttribute("aria-current",day.date === selectedDate ? "date" : "false");
+    button.append(el("span", "", day.date),el("small", "", `${day.count} 条`));
+    button.addEventListener("click",() => changeDay(day.date));
     fragment.append(button);
   }
   $("days").replaceChildren(fragment);
 }
-async function refresh() {
-  const generation = ++requestId;
-  $("refresh").disabled = true;
-  try {
-    await refreshDays();
-    const params = new URLSearchParams({date:selectedDate, q:query, page, limit});
-    const data = await get(`/api/records?${params}`);
-    if (generation !== requestId) return;
-    total = data.summary.count;
-    if (page > 1 && (page-1)*limit >= total) {page = Math.max(1, Math.ceil(total/limit)); return refresh();}
-    $("total").textContent = total;
-    $("duration").textContent = duration(data.summary.duration);
-    $("characters").textContent = data.summary.characters;
-    $("scope").textContent = query ? `关键词「${query}」的结果` : "当日全部记录";
-    $("listTitle").textContent = `${selectedDate} 的记录`;
-    $("pageInfo").textContent = `${page} / ${Math.max(1, Math.ceil(total/limit))} 页`;
-    $("export").href = `/api/export?${new URLSearchParams({date:selectedDate})}`;
-    $("notice").hidden = data.items.length > 0;
-    $("notice").className = "";
-    $("notice").textContent = query ? "没有找到匹配的内容，请尝试其他关键词。" : "这一天还没有有效转写记录。识别成功且有文本的录音会显示在这里。";
-    $("records").replaceChildren(...data.items.map(buildRecord));
-    $("prev").disabled = page <= 1;
-    $("next").disabled = page*limit >= total;
-  } catch(error) {
-    if (generation !== requestId) return;
-    $("notice").hidden = false;
-    $("notice").className = "error";
-    $("notice").textContent = `${error.message}，请点击刷新重试。`;
-  } finally {
-    if (generation === requestId) $("refresh").disabled = false;
+function reconcile(items, key) {
+  const sameView = renderedKey === key;
+  const shouldFollow = $("follow").checked && (!sameView || nearBottom());
+  const container = $("records"), next = new Map();
+  let cursor = container.firstChild, added = 0;
+  for (const record of items) {
+    const signature = JSON.stringify([record.started_at,record.text,record.segments]);
+    const previous = rendered.get(record.id);
+    let node;
+    if (previous && previous.signature === signature) node = previous.node;
+    else {
+      node = buildRecord(record);
+      if (previous) {
+        if (cursor === previous.node) cursor = previous.node.nextSibling;
+        previous.node.remove();
+      } else added++;
+    }
+    if (node === cursor) cursor = cursor.nextSibling;
+    else container.insertBefore(node,cursor);
+    next.set(record.id,{node,signature});
+  }
+  for (const [id, entry] of rendered) if (!next.has(id)) entry.node.remove();
+  rendered = next;
+  renderedKey = key;
+  if (!items.length) clearUnseen();
+  if (shouldFollow && added) {
+    requestAnimationFrame(() => {if (renderedKey === key && $("follow").checked) scrollToLatest();});
+  } else if (sameView && added) {
+    unseen += added;
+    $("newResults").textContent = `${unseen} 条新转写 · 查看最新 ↓`;
+    $("newResults").hidden = false;
   }
 }
-$("searchForm").addEventListener("submit", event => {event.preventDefault(); query = $("query").value.trim(); page=1; refresh();});
-$("query").addEventListener("search", () => {if(!$("query").value) {query=""; page=1; refresh();}});
-$("date").addEventListener("change", () => {if($("date").value) {selectedDate=$("date").value; page=1; refresh();}});
-$("refresh").addEventListener("click", refresh);
-$("prev").addEventListener("click", () => {if(page>1) {page--; refresh();}});
-$("next").addEventListener("click", () => {if(page*limit<total) {page++; refresh();}});
-setInterval(() => {
-  if (!document.hidden && !Array.from(document.querySelectorAll("audio")).some(a => !a.paused) && !$("refresh").disabled) refresh();
-}, 30000);
+async function get(url, signal, token=null) {
+  const response = await fetch(url,{cache:"no-store",signal,headers:token ? {"If-None-Match":token} : {}});
+  if (response.status === 304) return null;
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.error || `读取失败 (${response.status})`);
+  }
+  return {data:await response.json(),etag:response.headers.get("ETag")};
+}
+async function refresh(force=false) {
+  const generation = ++requestId;
+  if (activeRequest) activeRequest.abort();
+  const controller = new AbortController();
+  activeRequest = controller;
+  const timeout = setTimeout(() => controller.abort(),12000);
+  $("refresh").disabled = true;
+  try {
+    const meta = await get("/api/days",controller.signal);
+    if (generation !== requestId) return;
+    showMeta(meta.data);
+    const key = selectedDate + "\0" + query;
+    const params = new URLSearchParams({date:selectedDate,q:query,all:"1"});
+    const result = await get(`/api/records?${params}`,controller.signal,
+                             !force && fetchedKey === key ? etag : null);
+    if (generation !== requestId) return;
+    if (result) {
+      const data = result.data;
+      etag = result.etag;
+      fetchedKey = key;
+      reconcile(data.items,key);
+      $("total").textContent = data.summary.count;
+      $("characters").textContent = data.summary.characters;
+      $("latest").textContent = data.items.length ? clock(data.items[data.items.length-1].started_at) : "—";
+      $("scope").textContent = query ? `关键词「${query}」的结果` : "当天全部内容";
+      $("recordInfo").textContent = `共 ${data.summary.count} 条 · 全部显示 · 每 2 秒检查更新`;
+    }
+    $("listTitle").textContent = `${selectedDate} 的转写内容`;
+    $("export").href = `/api/export?${new URLSearchParams({date:selectedDate})}`;
+    $("notice").hidden = rendered.size > 0;
+    $("notice").className = "";
+    $("notice").textContent = query ? "没有找到匹配的内容，请尝试其他关键词。" : "暂无有效转写。ASR 完成后，有内容的结果会自动显示在这里。";
+    $("connection").classList.remove("error");
+    $("syncState").textContent = "自动更新 · 2 秒";
+    $("lastSync").textContent = `最近同步 ${meta.data.checked_at || new Date().toLocaleTimeString("zh-CN",{hour12:false})}`;
+  } catch(error) {
+    if (generation !== requestId) return;
+    $("connection").classList.add("error");
+    $("syncState").textContent = "连接中断 · 正在重试";
+    $("notice").hidden = false;
+    $("notice").className = "error";
+    const message = error.name === "AbortError" ? "请求超时" : error instanceof TypeError ? "暂时无法连接服务" : error.message;
+    $("notice").textContent = `${message}。将自动重试，已显示的文字会保留。`;
+  } finally {
+    clearTimeout(timeout);
+    if (generation === requestId) {activeRequest=null; $("refresh").disabled=false;}
+  }
+}
+function search() {
+  const next = $("query").value.trim();
+  if (next !== query) resetView();
+  query = next;
+  refresh(true);
+}
+$("searchForm").addEventListener("submit",event => {event.preventDefault(); search();});
+$("query").addEventListener("search",() => {if (!$("query").value) search();});
+$("date").addEventListener("change",() => {if ($("date").value) changeDay($("date").value);});
+$("today").addEventListener("click",() => changeDay(serverToday || selectedDate,true));
+$("refresh").addEventListener("click",() => refresh(true));
+$("follow").addEventListener("change",() => {if ($("follow").checked) scrollToLatest();});
+$("newResults").addEventListener("click",scrollToLatest);
+window.addEventListener("scroll",() => {if (unseen && nearBottom()) clearUnseen();},{passive:true});
+document.addEventListener("visibilitychange",() => {if (!document.hidden) refresh();});
+window.addEventListener("online",() => refresh());
+setInterval(() => {if (!document.hidden && !activeRequest) refresh();},2000);
 refresh();
