@@ -3,6 +3,7 @@ const $ = id => document.getElementById(id);
 let selectedDate = "", serverToday = "", followingToday = true, query = "";
 let requestId = 0, activeRequest = null, etag = null, fetchedKey = "";
 let renderedKey = "", rendered = new Map(), unseen = 0, daySignature = "";
+let pinnedToLatest = true;
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -22,7 +23,7 @@ function buildRecord(record) {
   const article = el("div", "record");
   article.dataset.recordId = record.id;
   const segments = record.segments.length ? [...record.segments] : [{speaker:"未知说话人",start:0,end:record.duration,text:record.text}];
-  segments.sort((a,b) => (b.start || 0) - (a.start || 0));
+  segments.sort((a,b) => (a.start || 0) - (b.start || 0));
   for (const item of segments) {
     const line = el("p", "transcript-line");
     const begin = timestamp(record.started_at,item.start || 0);
@@ -35,17 +36,28 @@ function buildRecord(record) {
   return article;
 }
 function nearLatest() {
-  return $("records").getBoundingClientRect().top >= -120;
+  const reader = $("reader");
+  return reader.scrollHeight - reader.scrollTop - reader.clientHeight <= 60;
 }
 function clearUnseen() {
   unseen = 0;
   $("newResults").hidden = true;
 }
-function scrollToLatest() {
-  $("follow").checked = true;
-  const top = $("records").getBoundingClientRect().top + window.scrollY;
-  window.scrollTo({top:Math.max(0,Math.min(window.scrollY,top-100)),behavior:"auto"});
+function updateReadingState() {
+  const reader = $("reader");
+  pinnedToLatest = reader.scrollHeight - reader.scrollTop - reader.clientHeight <= 2;
+  $("readingState").textContent = !rendered.size ? "等待转写内容" : !pinnedToLatest ? "正在阅读历史" : $("follow").checked ? "已定位最新 · 自动跟随" : "已定位最新 · 跟随已暂停";
+  if (!rendered.size || pinnedToLatest) clearUnseen();
+  else {
+    $("newResults").textContent = unseen ? `${unseen} 条新转写 · 回到最新 ↓` : "回到最新 ↓";
+    $("newResults").hidden = false;
+  }
+}
+function scrollToLatest(enableFollow=true) {
+  if (enableFollow) $("follow").checked = true;
+  $("reader").scrollTo({top:$("reader").scrollHeight,behavior:"auto"});
   clearUnseen();
+  updateReadingState();
 }
 function resetView() {
   etag = null;
@@ -58,6 +70,7 @@ function resetView() {
   $("notice").className = "";
   $("notice").textContent = "正在读取转写内容…";
   clearUnseen();
+  updateReadingState();
 }
 function changeDay(day, follow=day === serverToday) {
   if (day !== selectedDate) resetView();
@@ -93,10 +106,10 @@ function showMeta(data) {
 }
 function reconcile(items, key) {
   const sameView = renderedKey === key;
-  const shouldFollow = $("follow").checked && sameView && nearLatest();
+  const shouldFollow = !sameView || ($("follow").checked && nearLatest());
   const container = $("records"), next = new Map();
   let cursor = container.firstChild, added = 0;
-  for (const record of [...items].reverse()) {
+  for (const record of items) {
     const signature = JSON.stringify([record.started_at,record.text,record.segments]);
     const previous = rendered.get(record.id);
     let node;
@@ -117,12 +130,13 @@ function reconcile(items, key) {
   renderedKey = key;
   if (!items.length) clearUnseen();
   if (shouldFollow && added) {
-    requestAnimationFrame(() => {if (renderedKey === key && $("follow").checked) scrollToLatest();});
+    requestAnimationFrame(() => {if (renderedKey === key && (!sameView || $("follow").checked)) scrollToLatest(false);});
   } else if (sameView && added) {
     unseen += added;
-    $("newResults").textContent = `${unseen} 条新转写 · 查看最新 ↑`;
+    $("newResults").textContent = `${unseen} 条新转写 · 回到最新 ↓`;
     $("newResults").hidden = false;
   }
+  updateReadingState();
 }
 async function get(url, signal, token=null) {
   const response = await fetch(url,{cache:"no-store",signal,headers:token ? {"If-None-Match":token} : {}});
@@ -158,13 +172,14 @@ async function refresh(force=false) {
       $("characters").textContent = data.summary.characters;
       $("latest").textContent = data.items.length ? clock(data.items[data.items.length-1].started_at) : "—";
       $("scope").textContent = query ? `关键词「${query}」的结果` : "当天全部内容";
-      $("recordInfo").textContent = `共 ${data.summary.count} 条 · 最新在上 · 每 2 秒检查更新`;
+      $("recordInfo").textContent = "按时间正序 · 最新在底部";
     }
     $("listTitle").textContent = `${selectedDate} 的转写内容`;
     $("export").href = `/api/export?${new URLSearchParams({date:selectedDate})}`;
     $("notice").hidden = rendered.size > 0;
     $("notice").className = "";
     $("notice").textContent = query ? "没有找到匹配的内容，请尝试其他关键词。" : "暂无有效转写。ASR 完成后，有内容的结果会自动显示在这里。";
+    updateReadingState();
     $("connection").classList.remove("error");
     $("syncState").textContent = "自动更新 · 2 秒";
     $("lastSync").textContent = `最近同步 ${meta.data.checked_at || new Date().toLocaleTimeString("zh-CN",{hour12:false})}`;
@@ -190,11 +205,14 @@ function search() {
 $("searchForm").addEventListener("submit",event => {event.preventDefault(); search();});
 $("query").addEventListener("search",() => {if (!$("query").value) search();});
 $("date").addEventListener("change",() => {if ($("date").value) changeDay($("date").value);});
-$("today").addEventListener("click",() => changeDay(serverToday || selectedDate,true));
+$("today").addEventListener("click",() => {changeDay(serverToday || selectedDate,true); scrollToLatest();});
 $("refresh").addEventListener("click",() => refresh(true));
-$("follow").addEventListener("change",() => {if ($("follow").checked) scrollToLatest();});
-$("newResults").addEventListener("click",scrollToLatest);
-window.addEventListener("scroll",() => {if (unseen && nearLatest()) clearUnseen();},{passive:true});
+$("follow").addEventListener("change",() => {if ($("follow").checked) scrollToLatest(); else updateReadingState();});
+$("newResults").addEventListener("click",() => scrollToLatest());
+$("reader").addEventListener("scroll",updateReadingState,{passive:true});
+if (window.ResizeObserver) new ResizeObserver(() => {
+  if (pinnedToLatest && $("follow").checked) $("reader").scrollTop = $("reader").scrollHeight;
+}).observe($("reader"));
 document.addEventListener("visibilitychange",() => {if (!document.hidden) refresh();});
 window.addEventListener("online",() => refresh());
 setInterval(() => {if (!document.hidden && !activeRequest) refresh();},2000);
