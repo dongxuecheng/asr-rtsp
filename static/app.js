@@ -10,31 +10,32 @@ function el(tag, className, text) {
   if (text !== undefined) node.textContent = text;
   return node;
 }
-function clock(startedAt, offset=0) {
+function timestamp(startedAt, offset=0) {
   // Treat the server's local clock as a civil time, without browser TZ conversion.
   const time = Date.parse(startedAt.slice(0,23) + "Z") + offset*1000;
-  return Number.isFinite(time) ? new Date(time).toISOString().slice(11,19) : startedAt.slice(11,19);
+  return Number.isFinite(time) ? new Date(time).toISOString().slice(0,23).replace("T"," ") : startedAt.replace("T"," ");
+}
+function clock(startedAt, offset=0) {
+  return timestamp(startedAt,offset).slice(11,19);
 }
 function buildRecord(record) {
-  const article = el("article", "record");
+  const article = el("div", "record");
   article.dataset.recordId = record.id;
-  const time = el("time", "time", clock(record.started_at));
-  time.dateTime = record.started_at;
-  const card = el("div", "card");
-  const segments = record.segments.length ? record.segments : [{speaker:"未知说话人",start:0,text:record.text}];
+  const segments = record.segments.length ? [...record.segments] : [{speaker:"未知说话人",start:0,end:record.duration,text:record.text}];
+  segments.sort((a,b) => (b.start || 0) - (a.start || 0));
   for (const item of segments) {
-    const line = el("div", "segment");
-    const meta = el("div", "segment-meta");
-    meta.append(el("span", "speaker", item.speaker || "未知说话人"),
-                el("span", "segment-time", clock(record.started_at, item.start || 0)));
-    line.append(meta, el("p", "", item.text));
-    card.append(line);
+    const line = el("p", "transcript-line");
+    const begin = timestamp(record.started_at,item.start || 0);
+    const end = timestamp(record.started_at,item.end ?? record.duration).slice(11);
+    line.append(el("span", "transcript-time", `[${begin} - ${end}]`),document.createTextNode(" "),
+                el("span", "transcript-speaker", `[${item.speaker || "未知说话人"}]`),document.createTextNode(" "),
+                el("span", "transcript-text", item.text));
+    article.append(line);
   }
-  article.append(time, card);
   return article;
 }
-function nearBottom() {
-  return window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 150;
+function nearLatest() {
+  return $("records").getBoundingClientRect().top >= -120;
 }
 function clearUnseen() {
   unseen = 0;
@@ -42,7 +43,8 @@ function clearUnseen() {
 }
 function scrollToLatest() {
   $("follow").checked = true;
-  window.scrollTo({top:document.documentElement.scrollHeight,behavior:"auto"});
+  const top = $("records").getBoundingClientRect().top + window.scrollY;
+  window.scrollTo({top:Math.max(0,Math.min(window.scrollY,top-100)),behavior:"auto"});
   clearUnseen();
 }
 function resetView() {
@@ -91,10 +93,10 @@ function showMeta(data) {
 }
 function reconcile(items, key) {
   const sameView = renderedKey === key;
-  const shouldFollow = $("follow").checked && (!sameView || nearBottom());
+  const shouldFollow = $("follow").checked && sameView && nearLatest();
   const container = $("records"), next = new Map();
   let cursor = container.firstChild, added = 0;
-  for (const record of items) {
+  for (const record of [...items].reverse()) {
     const signature = JSON.stringify([record.started_at,record.text,record.segments]);
     const previous = rendered.get(record.id);
     let node;
@@ -118,7 +120,7 @@ function reconcile(items, key) {
     requestAnimationFrame(() => {if (renderedKey === key && $("follow").checked) scrollToLatest();});
   } else if (sameView && added) {
     unseen += added;
-    $("newResults").textContent = `${unseen} 条新转写 · 查看最新 ↓`;
+    $("newResults").textContent = `${unseen} 条新转写 · 查看最新 ↑`;
     $("newResults").hidden = false;
   }
 }
@@ -156,7 +158,7 @@ async function refresh(force=false) {
       $("characters").textContent = data.summary.characters;
       $("latest").textContent = data.items.length ? clock(data.items[data.items.length-1].started_at) : "—";
       $("scope").textContent = query ? `关键词「${query}」的结果` : "当天全部内容";
-      $("recordInfo").textContent = `共 ${data.summary.count} 条 · 全部显示 · 每 2 秒检查更新`;
+      $("recordInfo").textContent = `共 ${data.summary.count} 条 · 最新在上 · 每 2 秒检查更新`;
     }
     $("listTitle").textContent = `${selectedDate} 的转写内容`;
     $("export").href = `/api/export?${new URLSearchParams({date:selectedDate})}`;
@@ -192,7 +194,7 @@ $("today").addEventListener("click",() => changeDay(serverToday || selectedDate,
 $("refresh").addEventListener("click",() => refresh(true));
 $("follow").addEventListener("change",() => {if ($("follow").checked) scrollToLatest();});
 $("newResults").addEventListener("click",scrollToLatest);
-window.addEventListener("scroll",() => {if (unseen && nearBottom()) clearUnseen();},{passive:true});
+window.addEventListener("scroll",() => {if (unseen && nearLatest()) clearUnseen();},{passive:true});
 document.addEventListener("visibilitychange",() => {if (!document.hidden) refresh();});
 window.addEventListener("online",() => refresh());
 setInterval(() => {if (!document.hidden && !activeRequest) refresh();},2000);

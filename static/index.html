@@ -14,7 +14,7 @@
     <p class="side-note" id="retention">正在读取归档信息…</p>
   </aside>
   <main>
-    <header><div><span class="eyebrow">RTSP / ASR · LIVE</span><h1>实时转写</h1><p>当天的全部对话，按时间连续呈现。</p></div><span class="live" id="connection"><i></i><span id="syncState">正在连接…</span></span></header>
+    <header><div><span class="eyebrow">RTSP / ASR · LIVE</span><h1>实时转写</h1><p>当天全部转写，最新内容显示在上方。</p></div><span class="live" id="connection"><i></i><span id="syncState">正在连接…</span></span></header>
     <section class="toolbar" aria-label="查询条件">
       <div><label for="date">转写日期</label><div class="date-controls"><input type="date" id="date"><button id="today" class="outline" type="button">今天</button></div></div>
       <form id="searchForm"><label for="query">搜索当日内容</label><div class="search"><input type="search" id="query" placeholder="输入关键词，按回车搜索" maxlength="500"><button type="submit">搜索</button></div></form>
@@ -27,7 +27,7 @@
     </section>
     <section class="timeline"><div class="section-title"><div><h2 id="listTitle">当天转写</h2><span id="recordInfo">自动更新 · 每 2 秒检查</span></div><label class="follow"><input id="follow" type="checkbox" checked>跟随最新</label></div>
       <p id="notice" role="status" aria-live="polite">正在读取转写内容…</p>
-      <div id="records"></div>
+      <div id="records" class="transcript-sheet" role="region" aria-label="当日全部转写文本"></div>
     </section>
     <footer>显示 ASR 完成后的有效文本 · 时间使用采集端时区 <span id="timezone"></span></footer>
   </main>

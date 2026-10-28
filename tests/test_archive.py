@@ -110,18 +110,35 @@ class ArchiveTests(unittest.TestCase):
         self.assertFalse(list(Path(self.temp.name).rglob("*.txt")))
         self.assertEqual(self.store.days(),[])
 
-    def test_daily_txt_contains_chinese_timestamps_speaker_and_audio(self):
-        record_id = self.add("你好，自动保存文本。")
+    def test_daily_txt_contains_compact_ranges_speaker_and_text(self):
+        self.add("你好，自动保存文本。")
         self.add("第二条内容。",start=self.start+dt.timedelta(seconds=5))
         text = self.store.transcript_path(self.day).read_text(encoding="utf-8")
         self.assertIn(f"{self.day} ASR 记录",text)
-        self.assertIn(f"{self.day} 09:00:00.100",text)
-        self.assertIn(f"{self.day} 09:00:00.900",text)
-        self.assertIn("[speaker_0] 你好，自动保存文本。",text)
+        self.assertIn(f"[{self.day} 09:00:00.100 - 09:00:00.900] [speaker_0] 你好，自动保存文本。",text)
         self.assertEqual(text.count("第二条内容。"),1)
-        self.assertIn("audio/"+self.store.record(self.day,record_id)["audio_file"],text)
+        for removed in ("时长", "音频:", "audio/", ".wav", f"{self.day} 09:00:00.900", "09:00:00.000"):
+            self.assertNotIn(removed,text)
         exported = self.client.get(f"/api/export?date={self.day}").get_data(as_text=True)
         self.assertEqual(exported,text)
+
+    def test_compact_txt_range_handles_midnight(self):
+        start = self.start.replace(hour=23,minute=59,second=59,microsecond=700000)
+        self.add("跨午夜内容",start=start)
+        text = self.store.transcript_path(self.day).read_text(encoding="utf-8")
+        self.assertIn(f"[{self.day} 23:59:59.800 - 00:00:00.600] [speaker_0] 跨午夜内容",text)
+
+    def test_upgrade_rewrites_existing_verbose_txt(self):
+        self.add("保留正文")
+        target = self.store.transcript_path(self.day)
+        target.write_text(f"[{self.day} 09:00:00.000] 时长 1.00s\n音频: audio/old.wav\n"
+                          f"[{self.day} 09:00:00.100 - {self.day} 09:00:00.900] [speaker_0] 保留正文\n",encoding="utf-8")
+        self.store.sync_transcripts()
+        text = target.read_text(encoding="utf-8")
+        self.assertIn(f"[{self.day} 09:00:00.100 - 09:00:00.900] [speaker_0] 保留正文",text)
+        self.assertNotIn("时长",text)
+        self.assertNotIn("音频:",text)
+        self.assertEqual(text.count("保留正文"),1)
 
     def test_daily_txt_backfills_old_records_and_repairs_without_duplicates(self):
         self.add("较晚内容",start=self.start+dt.timedelta(seconds=5))

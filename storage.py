@@ -104,16 +104,16 @@ class Store:
     @staticmethod
     def _format_transcript_record(row):
         started = dt.datetime.fromisoformat(row["started_at"])
-        timestamp = lambda value: value.isoformat(sep=" ", timespec="milliseconds")
-        lines = [f"\n[{timestamp(started)}] 时长 {row['duration']:.2f}s\n",
-                 f"音频: audio/{row['audio_file']}\n"]
+        lines = []
         segments = json.loads(row["segments"])
         if not segments:
             segments = [{"start":0, "end":row["duration"], "speaker":"未知说话人", "text":row["text"]}]
         for segment in segments:
             begin = started + dt.timedelta(seconds=segment.get("start", 0))
             end = started + dt.timedelta(seconds=segment.get("end", row["duration"]))
-            lines.append(f"[{timestamp(begin)} - {timestamp(end)}] "
+            begin_text = begin.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            end_text = end.strftime("%H:%M:%S.%f")[:-3]
+            lines.append(f"[{begin_text} - {end_text}] "
                          f"[{segment.get('speaker', '未知说话人')}] {segment['text']}\n")
         return "".join(lines)
 
