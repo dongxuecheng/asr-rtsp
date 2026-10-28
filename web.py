@@ -1,7 +1,6 @@
 """Read-only archive API and browser UI (the collector owns all writes)."""
 import datetime as dt
 import hmac
-import json
 import os
 from pathlib import Path
 import re
@@ -9,7 +8,7 @@ import sqlite3
 
 from flask import Flask, Response, abort, jsonify, request, send_file
 
-from storage import Store, valid_day, VISIBLE_RECORD_SQL
+from storage import Store, valid_day
 
 
 def create_app(config=None):
@@ -110,14 +109,7 @@ def create_app(config=None):
     @app.get("/api/export")
     def export():
         day = day_arg()
-        rows = store._read(day, f"SELECT * FROM records WHERE {VISIBLE_RECORD_SQL} ORDER BY started_at, id")
-        lines = [f"{day} ASR 记录（{app.config['ARCHIVE_TIMEZONE']}）\n"]
-        for row in rows:
-            lines.append(f"\n[{row['started_at'].replace('T', ' ')}] {row['duration']:.2f}s · {row['status']}\n")
-            if row["text"]:
-                for segment in json.loads(row["segments"]):
-                    started = dt.datetime.fromisoformat(row["started_at"]) + dt.timedelta(seconds=segment["start"])
-                    lines.append(f"[{started:%H:%M:%S}] [{segment['speaker']}] {segment['text']}\n")
-        return Response("".join(lines), mimetype="text/plain", headers={"Content-Disposition": f'attachment; filename="asr_{day}.txt"'})
+        text = store.transcript_text(day, app.config["ARCHIVE_TIMEZONE"])
+        return Response(text, mimetype="text/plain", headers={"Content-Disposition": f'attachment; filename="asr_{day}.txt"'})
 
     return app

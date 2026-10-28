@@ -167,6 +167,7 @@ def cleanup_loop(store, interval, stop_event):
             purged = store.purge_unrecognized()
             if purged:
                 log_print(f"[定时清理] 已删除 {purged} 条未成功转写的历史录音")
+            store.sync_transcripts()
         except Exception as exc:
             log_print(f"[定时清理] 失败，将在下轮重试: {exc}")
         stop_event.wait(interval)
@@ -184,6 +185,7 @@ def listen_rtsp(args, extra_form, stop_event=None):
     store = Store(args.output_dir, args.retention_days)
     store.cleanup()
     store.purge_unrecognized()
+    store.sync_transcripts()
     task_queue = queue.Queue(maxsize=args.queue_size)
     threads = [threading.Thread(target=worker, args=(i+1, task_queue, args, extra_form),
                                 name=f"asr-worker-{i+1}", daemon=True) for i in range(args.workers)]

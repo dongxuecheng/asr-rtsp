@@ -1,4 +1,4 @@
-"""Per-day SQLite + WAV storage. One collector writer, read-only web readers."""
+"""Per-day SQLite, WAV and UTF-8 transcript storage; read-only web readers."""
 from contextlib import closing
 import datetime as dt
 import json
@@ -77,6 +77,10 @@ class Store:
                 temporary.unlink(missing_ok=True)
                 audio_file.unlink(missing_ok=True)
                 raise
+            try:
+                self._append_transcript(day, record_id)
+            except (OSError, ValueError, sqlite3.Error):
+                logging.exception("写入转写 TXT 失败；文本和音频已归档，后续同步会修复：%s", day)
             if payload is not None:
                 raw_dir = directory / "raw_json"
                 target = raw_dir / f"{record_id}.json"
@@ -90,6 +94,82 @@ class Store:
                 finally:
                     temp.unlink(missing_ok=True)
             return record_id
+
+    @staticmethod
+    def _transcript_header(day, timezone=None):
+        timezone = timezone or os.getenv("TZ", "Asia/Shanghai")
+        return f"{day} ASR 记录（{timezone}）\n"
+
+    @staticmethod
+    def _format_transcript_record(row):
+        started = dt.datetime.fromisoformat(row["started_at"])
+        timestamp = lambda value: value.isoformat(sep=" ", timespec="milliseconds")
+        lines = [f"\n[{timestamp(started)}] 时长 {row['duration']:.2f}s\n",
+                 f"音频: audio/{row['audio_file']}\n"]
+        segments = json.loads(row["segments"])
+        if not segments:
+            segments = [{"start":0, "end":row["duration"], "speaker":"未知说话人", "text":row["text"]}]
+        for segment in segments:
+            begin = started + dt.timedelta(seconds=segment.get("start", 0))
+            end = started + dt.timedelta(seconds=segment.get("end", row["duration"]))
+            lines.append(f"[{timestamp(begin)} - {timestamp(end)}] "
+                         f"[{segment.get('speaker', '未知说话人')}] {segment['text']}\n")
+        return "".join(lines)
+
+    def transcript_text(self, day, timezone=None):
+        rows = self._read(day, f"SELECT * FROM records WHERE {VISIBLE_RECORD_SQL} ORDER BY started_at, id")
+        return self._transcript_header(day, timezone) + "".join(self._format_transcript_record(row) for row in rows)
+
+    def transcript_path(self, day):
+        directory = self.day_dir(day)
+        target = directory / f"asr_{day}.txt"
+        if target.is_symlink() or target.resolve().parent != directory:
+            raise ValueError("无效的转写 TXT 路径")
+        return target
+
+    def _append_transcript(self, day, record_id):
+        target = self.transcript_path(day)
+        if not target.exists():
+            # Also include older database-only records on the first write.
+            self._sync_transcript(day)
+            return
+        row = self.record(day, record_id)
+        if row:
+            with target.open("a", encoding="utf-8", newline="\n") as file:
+                file.write(self._format_transcript_record(row))
+
+    def _sync_transcript(self, day):
+        """Atomically rebuild a day's TXT from the canonical database."""
+        target = self.transcript_path(day)
+        rows = self._read(day, f"SELECT * FROM records WHERE {VISIBLE_RECORD_SQL} ORDER BY started_at, id")
+        if not rows:
+            target.unlink(missing_ok=True)
+            return
+        content = self._transcript_header(day) + "".join(self._format_transcript_record(row) for row in rows)
+        try:
+            if target.read_text(encoding="utf-8") == content:
+                return
+        except (FileNotFoundError, UnicodeError):
+            pass
+        temporary = target.with_suffix(".txt.tmp")
+        if temporary.is_symlink() or temporary.resolve().parent != target.parent:
+            raise ValueError("无效的转写 TXT 临时路径")
+        try:
+            temporary.write_text(content, encoding="utf-8", newline="\n")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def sync_transcripts(self):
+        """Backfill or repair retained daily transcripts on startup and cleanup."""
+        with STORAGE_LOCK:
+            for day in self._day_names():
+                if self.expired(day):
+                    continue
+                try:
+                    self._sync_transcript(day)
+                except (OSError, ValueError, sqlite3.Error):
+                    logging.exception("同步转写 TXT 失败，将在下轮清理时重试：%s", day)
 
     def _discard_unrecognized(self, day, record_id):
         """Remove files before the row, so interrupted purges remain retryable."""
@@ -123,8 +203,14 @@ class Store:
         removed = 0
         with STORAGE_LOCK:
             for day in self._day_names():
-                for row in self._read(day, f"SELECT id FROM records WHERE NOT ({VISIBLE_RECORD_SQL})"):
+                invalid = self._read(day, f"SELECT id FROM records WHERE NOT ({VISIBLE_RECORD_SQL})")
+                for row in invalid:
                     removed += int(self._discard_unrecognized(day, row["id"]))
+                if invalid:
+                    try:
+                        self._sync_transcript(day)
+                    except (OSError, ValueError, sqlite3.Error):
+                        logging.exception("清理历史无效记录后同步 TXT 失败：%s", day)
         return removed
 
     def _read(self, day, query, parameters=()):

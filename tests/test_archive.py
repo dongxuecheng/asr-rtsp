@@ -1,5 +1,6 @@
 import base64
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import io
 import json
@@ -106,7 +107,58 @@ class ArchiveTests(unittest.TestCase):
             self.assertIsNone(self.store.save(self.start,self.pcm,[{"text":text}],payload={"text":text}))
         self.assertFalse(list(Path(self.temp.name).rglob("*.wav")))
         self.assertFalse(list(Path(self.temp.name).rglob("*.json")))
+        self.assertFalse(list(Path(self.temp.name).rglob("*.txt")))
         self.assertEqual(self.store.days(),[])
+
+    def test_daily_txt_contains_chinese_timestamps_speaker_and_audio(self):
+        record_id = self.add("你好，自动保存文本。")
+        self.add("第二条内容。",start=self.start+dt.timedelta(seconds=5))
+        text = self.store.transcript_path(self.day).read_text(encoding="utf-8")
+        self.assertIn(f"{self.day} ASR 记录",text)
+        self.assertIn(f"{self.day} 09:00:00.100",text)
+        self.assertIn(f"{self.day} 09:00:00.900",text)
+        self.assertIn("[speaker_0] 你好，自动保存文本。",text)
+        self.assertEqual(text.count("第二条内容。"),1)
+        self.assertIn("audio/"+self.store.record(self.day,record_id)["audio_file"],text)
+        exported = self.client.get(f"/api/export?date={self.day}").get_data(as_text=True)
+        self.assertEqual(exported,text)
+
+    def test_daily_txt_backfills_old_records_and_repairs_without_duplicates(self):
+        self.add("较晚内容",start=self.start+dt.timedelta(seconds=5))
+        self.add("较早内容")
+        target = self.store.transcript_path(self.day)
+        target.unlink()  # Simulate an older deployment that only wrote SQLite.
+        restarted = Store(self.temp.name)
+        restarted.sync_transcripts()
+        text = target.read_text(encoding="utf-8")
+        self.assertLess(text.index("较早内容"),text.index("较晚内容"))
+        restarted.sync_transcripts()
+        self.assertEqual(target.read_text(encoding="utf-8"),text)
+        target.write_bytes(b"partial\xff")
+        restarted.sync_transcripts()
+        self.assertEqual(target.read_text(encoding="utf-8"),text)
+
+    def test_concurrent_workers_append_each_transcript_once(self):
+        def save(index):
+            store = Store(self.temp.name)
+            return store.save(self.start,self.pcm,[{"text":f"并发记录-{index}。"}])
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            ids = list(executor.map(save,range(8)))
+        self.assertEqual(len(set(ids)),8)
+        text = self.store.transcript_path(self.day).read_text(encoding="utf-8")
+        for index in range(8):
+            self.assertEqual(text.count(f"并发记录-{index}。"),1)
+
+    def test_txt_write_failure_preserves_archive_and_is_repaired(self):
+        self.add("先前内容")
+        with patch.object(Store,"_append_transcript",side_effect=PermissionError("busy")), self.assertLogs(level="ERROR"):
+            record_id = self.add("等待补齐的内容")
+        self.assertEqual(self.store.record(self.day,record_id)["text"],"等待补齐的内容")
+        self.assertEqual(len(list(Path(self.temp.name).rglob("*.wav"))),2)
+        self.store.sync_transcripts()
+        text = self.store.transcript_path(self.day).read_text(encoding="utf-8")
+        self.assertEqual(text.count("先前内容"),1)
+        self.assertEqual(text.count("等待补齐的内容"),1)
 
     def test_query_pagination_export_and_range_audio(self):
         record_id = self.add("关键词 <script>alert('x')</script>")
@@ -151,6 +203,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(self.store._read(self.day,"SELECT id FROM records"),[])
         self.assertFalse(list(Path(self.temp.name).rglob("*.wav")))
         self.assertFalse(list(Path(self.temp.name).rglob("*.json")))
+        self.assertFalse(list(Path(self.temp.name).rglob("*.txt")))
 
     def test_purge_keeps_successful_records_and_runs_with_retention_off(self):
         valid = self.add("保留有效内容")
@@ -181,6 +234,7 @@ class ArchiveTests(unittest.TestCase):
         expired_day = expired_time.date().isoformat()
         permanent.save(expired_time,self.pcm,[{"text":"old"}],payload={"text":"old"})
         permanent.save(keep_time,self.pcm,[{"text":"keep"}])
+        self.assertTrue(permanent.transcript_path(expired_day).exists())
         runtime = Path(self.temp.name)/expired_day/"runtime"
         runtime.mkdir()
         (runtime/"old.log").write_text("old")
@@ -190,6 +244,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(self.store.cleanup(),[expired_day])
         self.assertFalse((Path(self.temp.name)/expired_day).exists())
         self.assertTrue((Path(self.temp.name)/keep_time.date().isoformat()).exists())
+        self.assertIn("keep",self.store.transcript_path(keep_time.date().isoformat()).read_text(encoding="utf-8"))
         self.assertTrue(unrelated.exists())
         # A late ASR result must not recreate a deleted archive day.
         self.assertIsNone(self.store.save(expired_time,self.pcm,[{"text":"late"}]))
@@ -201,6 +256,8 @@ class ArchiveTests(unittest.TestCase):
         self.add(start=previous)
         self.add(start=today)
         self.assertEqual(len(self.store.days()),2)
+        self.assertTrue(self.store.transcript_path(previous.date().isoformat()).exists())
+        self.assertTrue(self.store.transcript_path(today.date().isoformat()).exists())
 
     def test_validation_and_no_path_traversal(self):
         for value in ("../../other", "2026-02-30", "2026-1-1"):
@@ -254,6 +311,7 @@ class ArchiveTests(unittest.TestCase):
             worker(1,tasks,args,{})
         self.assertEqual(self.store.records(self.day)["items"],[])
         self.assertFalse(list(Path(self.temp.name).rglob("*.wav")))
+        self.assertFalse(list(Path(self.temp.name).rglob("asr_*.txt")))
 
     def test_worker_empty_or_invalid_responses_are_not_saved(self):
         args = parse_args(["rtsp://example/stream","--output-dir",self.temp.name,"--retry-count","0","--save-json"])
@@ -277,6 +335,7 @@ class ArchiveTests(unittest.TestCase):
                 self.assertEqual(self.store.records(self.day)["items"],[])
                 self.assertFalse(list(Path(self.temp.name).rglob("*.wav")))
                 self.assertFalse(list(Path(self.temp.name).rglob("*.json")))
+                self.assertFalse(list(Path(self.temp.name).rglob("asr_*.txt")))
 
     def test_retry_success_saves_only_the_successful_result(self):
         args = parse_args(["rtsp://example/stream","--output-dir",self.temp.name,"--retry-count","1"])
